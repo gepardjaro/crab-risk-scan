@@ -84,12 +84,19 @@ def checkov(doc, root):
     for block in doc if isinstance(doc, list) else [doc]:
         checks = block["results"]
         result.partial |= bool(array(checks.get("parsing_errors", [])))
+        count = block.get("summary", {}).get("parsing_errors", 0)
+        if type(count) is not int or count < 0:
+            raise ValueError("invalid parser error count")
+        result.partial |= count > 0
         for row in array(checks["failed_checks"]):
-            # Checkov's file_path is prefixed with slash relative to its scan root.
-            path = row.get("repo_file_path") or row["file_path"].removeprefix("/")
+            # Both Checkov fields use a virtual leading slash. file_path is relative
+            # to the scan root, whereas repo_file_path depends on the producer's cwd.
+            path = (row.get("file_path") or row["repo_file_path"]).removeprefix("/")
             start, end = array(row["file_line_range"])
-            resource = token(row["resource"])
-            hit = source("checkov", "Burrow", row["check_id"], relative_path(path, root),
+            resource = row["resource"]
+            if not isinstance(resource, str) or not re.fullmatch(r"""[\w.:/@+\[\]"'=-]{1,512}""", resource):
+                raise ValueError("invalid resource address")
+            hit = source("checkov", "Burrow", row["check_id"], relative_path(path),
                          start, end, row.get("severity") or "unknown", identity=resource)
             hit.update(resource=resource, framework=token(block["check_type"]))
             result.findings.append(hit)

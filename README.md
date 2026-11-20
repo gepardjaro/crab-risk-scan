@@ -19,7 +19,8 @@ The first command after installation reports two medium findings. The second add
 | Command | Output | Exit status |
 |---|---|---|
 | `scan DIRECTORY` | Original v1 JSON report covering the built-in Python TLS and Dockerfile USER checks | 0 clean within measured coverage, 1 findings, 2 incomplete |
-| `collect DIRECTORY [--trivy FILE ...]` | v2 JSON report. Repeat the flag for each Trivy filesystem language-package report from the same snapshot. Includes normalized severity, origin, fingerprints and import counts. | 0 clean, 1 findings, 2 incomplete |
+| `collect DIRECTORY [options]` | v2 JSON or SARIF. Combines Pinch checks with saved scanner reports, groups corroborating observations, links SBOM components and applies a reviewed policy. | 0 policy passed, 1 actionable observations, 2 incomplete |
+| `rules` | Path to the installed Opengrep rule pack for JavaScript, TypeScript and Rust. | 0 success |
 | `sbom DIRECTORY [--output FILE]` | A CycloneDX JSON inventory produced by an installed Syft CLI. Defaults to stdout. | 0 inventory generated, 2 failure |
 
 ### Generate an SBOM
@@ -41,16 +42,27 @@ trivy fs --scanners vuln --pkg-types library --format json --output deps.json /p
 crab-risk-scan collect /path/to/checkout --trivy deps.json
 ```
 
+### Run a combined assessment
+
+Install the parser extras with `python -m pip install '.[pinch]'` for PostgreSQL and the Mojo Python binding. The Mojo rule also needs its compiled grammar. Supply JSON reports from the same snapshot using repeatable flags or a run manifest. The following example assumes that the two input reports already exist.
+
+```sh
+crab-risk-scan collect /path/to/checkout --bandit bandit.json --trivy deps.json --inventory checkout.cdx.json --fail-on high
+crab-risk-scan collect /path/to/checkout --run-manifest run.json --baseline baseline.json --format sarif > crab.sarif
+```
+
+Use the checkout's own CycloneDX file for `--inventory`. The default threshold includes unknown-severity findings. See [scanner commands, provenance and policy examples](docs/integrations.md).
+
 ## The CRAB ecosystem
 
 | Feature | Name | Implemented or planned |
 |---|---|---|
-| SAST | Claws | Built-in Python TLS check. Bandit and Opengrep adapters planned. |
-| SCA and SBOM | Shell | Imports Trivy dependency findings. Generates CycloneDX inventories with Syft. |
-| Secrets | Sniffer | Gitleaks report adapter planned. |
-| IaC | Burrow | Built-in final-stage Dockerfile USER check. Checkov Terraform and Kubernetes adapters planned. |
-| Container security | Exoskeleton | Trivy image package findings and digest-based correlation planned. |
-| Rule engine | Pinch | Built-in rule dispatch. Versioned rule packs and dialect-specific rules planned. |
-| Reporting | Crab Trap | Unified JSON, exact deduplication and severity ordering. Cross-engine correlation and SARIF planned. |
+| SAST | Claws | Imports Bandit, Opengrep, ShellCheck and PSScriptAnalyzer diagnostics. |
+| SCA and SBOM | Shell | Imports Trivy and OSV lockfile advisories. Generates CycloneDX inventories with Syft. |
+| Secrets | Sniffer | Imports Gitleaks locations and rule IDs. Drops secret values, snippets and free-text diagnostics. |
+| IaC | Burrow | Checks Dockerfile USER and imports Checkov resource findings. |
+| Container security | Exoskeleton | Imports Trivy image vulnerabilities scoped to the image manifest digest. |
+| Rule engine | Pinch | Ships rules for Python, Dockerfile, HTML, PostgreSQL and experimental Mojo, plus an Opengrep pack. |
+| Reporting | Crab Trap | JSON, SARIF, severity gates, suppressions, source and advisory correlation, and inventory links. |
 
 [Language scope and gap analysis](docs/coverage.md) · [Architecture and finding model](docs/architecture.md) · [Naming review](docs/naming.md) · [Contributor workflows](AGENTS.md) · [Apache-2.0 license](LICENSE)
