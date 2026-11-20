@@ -29,10 +29,16 @@ def collect(local, paths=(), *, root=None, inputs=(), run_manifest=None, revisio
     findings = []
     errors = list(local["errors"])
     occurrences = Counter((h["path"], h["line"], h["rule"]) for h in local["findings"])
+    ordinals = Counter()
     for hit in local["findings"]:
         key = ["crab", hit["path"], hit["line"], hit["rule"]]
-        if occurrences[tuple(key[1:])] > 1 and "byte_offset" in hit:
-            key.extend([hit["byte_offset"], hit["end_byte_offset"]])
+        anchor = tuple(key[1:])
+        if occurrences[anchor] > 1:
+            if "byte_offset" in hit:
+                key.extend([hit["byte_offset"], hit["end_byte_offset"]])
+            else:
+                ordinals[anchor] += 1
+                key.append(ordinals[anchor])
         module = "Burrow" if hit["rule"] == "CRAB-CTR-001" else "Claws"
         findings.append(dict(hit, fingerprint=fingerprint(key), producer="crab", module=module,
                              producer_version="0.2.0", rule_pack="pinch-v1",

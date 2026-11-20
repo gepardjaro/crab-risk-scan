@@ -126,6 +126,8 @@ class ArchitectureTests(unittest.TestCase):
         (self.root / "form.html").write_text('<FORM action="http://example.invalid/save">')
         hit, = self.collect(1)["findings"]
         self.assertEqual(hit["rule"], "CRAB-HTML-001")
+        (self.root / "form.html").write_text('<form action="http://a.test"></form><form action="http://b.test">')
+        self.assertEqual(len(self.collect(1)["groups"]), 2)
 
     @unittest.skipUnless(os.getenv("CRAB_MOJO_GRAMMAR"), "requires optional Pinch parsers")
     def test_parser_gates(self):
