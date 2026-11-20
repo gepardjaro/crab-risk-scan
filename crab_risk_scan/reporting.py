@@ -60,7 +60,7 @@ def collect(local, paths=(), *, root=None, inputs=(), run_manifest=None, revisio
             if batch.version and meta.get("version") and batch.version != meta["version"]:
                 raise ValueError("version mismatch")
             version = batch.version or meta.get("version")
-            entry.update(producer_version=version, targets=batch.targets, status="complete")
+            entry.update(producer_version=version, targets=batch.targets, status=meta.get("status", "imported"))
             if batch.partial or meta.get("status") == "partial":
                 entry["status"] = "partial"
                 errors.append({"input": index, "producer": name, "reason": "producer_partial"})

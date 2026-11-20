@@ -100,6 +100,8 @@ def shellcheck(doc, root):
     result = ImportResult()
     for row in array(doc):
         code = positive_integer(row["code"])
+        if code in {1009, 1072, 1073, 1089}:
+            result.partial = True
         if code not in {2086, 2046, 2068, 2294}:
             continue
         result.findings.append(source("shellcheck", "Claws", f"SC{code}",
@@ -111,6 +113,9 @@ def shellcheck(doc, root):
 def psscriptanalyzer(doc, root):
     result = ImportResult()
     for row in array(doc):
+        if row["Severity"] == "ParseError":
+            result.partial = True
+            continue
         extent = row["Extent"]
         result.findings.append(source("psscriptanalyzer", "Claws", row["RuleName"],
                                       relative_path(row["ScriptPath"], root), extent["StartLineNumber"],

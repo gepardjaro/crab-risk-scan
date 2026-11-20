@@ -35,6 +35,19 @@ jobs:
           echo "37e93f4da5fd04a18c5c1febbdd12f7e98dfccd4d0c9cf2593bcb25eeb462da0  $RUNNER_TEMP/opengrep" | sha256sum -c -
           chmod +x "$RUNNER_TEMP/opengrep"
           echo "CRAB_OPENGREP=$RUNNER_TEMP/opengrep" >> "$GITHUB_ENV"
+      - name: Install infrastructure and secrets engines in isolation
+        if: matrix.python == '3.10'
+        run: |
+          python -m venv "$RUNNER_TEMP/checkov"
+          "$RUNNER_TEMP/checkov/bin/pip" install --quiet checkov==3.2.495
+          echo "CRAB_CHECKOV=$RUNNER_TEMP/checkov/bin/checkov" >> "$GITHUB_ENV"
+          curl --fail --location --retry 3 https://github.com/gitleaks/gitleaks/releases/download/v8.28.0/gitleaks_8.28.0_linux_x64.tar.gz -o "$RUNNER_TEMP/gitleaks.tar.gz"
+          echo "a65b5253807a68ac0cafa4414031fd740aeb55f54fb7e55f386acb52e6a840eb  $RUNNER_TEMP/gitleaks.tar.gz" | sha256sum -c -
+          tar xzf "$RUNNER_TEMP/gitleaks.tar.gz" -C "$RUNNER_TEMP" gitleaks
+          echo "CRAB_GITLEAKS=$RUNNER_TEMP/gitleaks" >> "$GITHUB_ENV"
+          curl --fail --location --retry 3 https://github.com/PowerShell/PSScriptAnalyzer/releases/download/1.24.0/PSScriptAnalyzer.1.24.0.nupkg -o "$RUNNER_TEMP/pssa.zip"
+          mkdir -p "$HOME/.local/share/powershell/Modules/PSScriptAnalyzer/1.24.0"
+          unzip -oq "$RUNNER_TEMP/pssa.zip" -d "$HOME/.local/share/powershell/Modules/PSScriptAnalyzer/1.24.0"
       - name: Install the Syft integration-test version
         uses: anchore/sbom-action/download-syft@fbfd9c6c189226748411491745178e0c2017392d
         id: syft
