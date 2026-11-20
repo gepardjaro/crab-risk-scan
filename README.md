@@ -53,4 +53,4 @@ crab-risk-scan collect /path/to/checkout --trivy deps.json
 | Rule engine | Pinch | Built-in rule dispatch. Versioned rule packs and dialect-specific rules planned. |
 | Reporting | Crab Trap | Unified JSON, exact deduplication and severity ordering. Cross-engine correlation and SARIF planned. |
 
-[Language scope and gap analysis](docs/coverage.md) · [Architecture and finding model](docs/architecture.md) · [Naming review](docs/naming.md) · [Contributor workflows](AGENTS.md) · [Apache-2.0 license](LICENSE)
+[Language scope and gap analysis](docs/coverage.md) · [Architecture and finding model](docs/architecture.md) · [Contributor workflows](AGENTS.md) · [Apache-2.0 license](LICENSE)
