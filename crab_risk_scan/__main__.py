@@ -10,13 +10,17 @@ from pathlib import Path
 
 from .rules import detector
 from .reporting import collect
+from .adapters import ADAPTERS
+from .evidence import LEVELS, token
+from .pinch import html, mojo, postgres
+from .triage import sarif
 from .sbom import generate
 
 EXCLUDE = {".git", ".venv", "__pycache__", "node_modules"}
 LIMIT = 1024 * 1024
 
 
-def scan(root):
+def scan(root, *, extended=False, grammar=None):
     findings = []
     errors = []
     scanned = 0
@@ -32,6 +36,10 @@ def scan(root):
             for name in sorted(files):
                 path = Path(folder) / name
                 check = detector(path)
+                if extended:
+                    check = {".html": html, ".htm": html, ".sql": postgres,
+                             ".mojo": lambda source: mojo(source, grammar),
+                             ".🔥": lambda source: mojo(source, grammar)}.get(path.suffix.lower(), check)
                 if check is None:
                     continue
                 rel = path.relative_to(root).as_posix()
@@ -44,9 +52,14 @@ def scan(root):
                         errors.append({"path": rel, "reason": "size_limit"})
                         continue
                     hits = list(check(raw.decode("utf-8-sig")))
-                    findings.extend(dict(path=rel, **asdict(hit)) for hit in hits)
+                    for hit in hits:
+                        fields = asdict(hit)
+                        for field in ("byte_offset", "end_byte_offset", "end_line"):
+                            if not extended or fields[field] is None:
+                                fields.pop(field)
+                        findings.append(dict(path=rel, **fields))
                     scanned += 1
-                except (SyntaxError, ValueError, RecursionError, OSError) as exc:
+                except (SyntaxError, ValueError, RecursionError, OSError, ImportError, AttributeError) as exc:
                     errors.append({"path": rel, "reason": type(exc).__name__})
     findings.sort(key=lambda f: (f["path"], f["line"], f["rule"]))
     return {"schema_version": 1, "files_scanned": scanned, "findings": findings,
@@ -56,16 +69,28 @@ def scan(root):
 def main():
     parser = argparse.ArgumentParser(prog="crab-risk-scan", description="CRAB — Code Risk Analysis Bot")
     sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("rules", help="print the installed Opengrep rule-pack path")
     command = sub.add_parser("scan", help="scan a local repository snapshot")
     command.add_argument("directory", type=Path)
-    combined = sub.add_parser("collect", help="combine source checks and saved dependency findings")
+    combined = sub.add_parser("collect", help="scan a snapshot and correlate saved scanner reports")
     combined.add_argument("directory", type=Path)
-    combined.add_argument("--trivy", type=Path, action="append", default=[], metavar="REPORT")
+    for producer in ADAPTERS:
+        combined.add_argument("--" + producer, type=Path, action="append", default=[], metavar="REPORT")
+    combined.add_argument("--run-manifest", type=Path, help="versioned scanner inputs and completion status")
+    combined.add_argument("--revision", type=token, help="snapshot identity for correlation")
+    combined.add_argument("--inventory", type=Path, help="link a CycloneDX JSON SBOM for this snapshot")
+    combined.add_argument("--baseline", type=Path, help="reviewed exact-fingerprint suppressions")
+    combined.add_argument("--fail-on", choices=LEVELS, default="unknown", help="minimum severity for exit 1")
+    combined.add_argument("--format", choices=("json", "sarif"), default="json")
+    combined.add_argument("--mojo-grammar", type=Path, help="absolute path to a trusted Mojo grammar library")
     inventory = sub.add_parser("sbom", help="catalog a local repository with Syft")
     inventory.add_argument("directory", type=Path)
     inventory.add_argument("--syft", type=Path, help="absolute path to a trusted Syft binary")
     inventory.add_argument("--output", type=Path, help="write CycloneDX JSON atomically to a file")
     args = parser.parse_args()
+    if args.command == "rules":
+        print(Path(__file__).with_name("opengrep-v1.yml").resolve())
+        return 0
     if args.command == "sbom":
         try:
             bom = generate(args.directory, args.syft)
@@ -88,9 +113,19 @@ def main():
             print(f"SBOM generation failed: {reason}", file=sys.stderr)
             return 2
         return 0
-    report = scan(args.directory)
     if args.command == "collect":
-        report = collect(report, args.trivy)
+        grammar = args.mojo_grammar
+        if grammar and (not grammar.is_absolute() or not grammar.is_file()
+                        or grammar.resolve().is_relative_to(args.directory.resolve())):
+            combined.error("--mojo-grammar requires a trusted library outside the scanned directory")
+        inputs = [(name, path, {}) for name in ADAPTERS
+                  for path in getattr(args, name.replace("-", "_"))]
+        report = collect(scan(args.directory, extended=True, grammar=grammar), root=args.directory,
+                         inputs=inputs, run_manifest=args.run_manifest, revision=args.revision,
+                         inventory=args.inventory, baseline=args.baseline, threshold=args.fail_on)
+        print(json.dumps(sarif(report) if args.format == "sarif" else report, indent=2))
+        return 2 if report["errors"] else int(report["policy"]["actionable"] > 0)
+    report = scan(args.directory)
     print(json.dumps(report, indent=2))
     return 2 if report["errors"] else int(bool(report["findings"]))
 

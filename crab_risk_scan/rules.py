@@ -10,6 +10,9 @@ class Hit:
     line: int
     severity: str
     message: str
+    byte_offset: int | None = None
+    end_byte_offset: int | None = None
+    end_line: int | None = None
 
 
 def python_tls(source):
@@ -20,7 +23,8 @@ def python_tls(source):
         owner = node.func.value
         if isinstance(owner, ast.Name) and owner.id == "ssl" and node.func.attr == "_create_unverified_context":
             yield Hit("CRAB-PY-001", node.lineno, "medium",
-                      "Review use of an unverified TLS context. Prefer ssl.create_default_context().")
+                      "Review use of an unverified TLS context. Prefer ssl.create_default_context().",
+                      node.col_offset, node.end_col_offset, node.end_lineno)
 
 
 def docker_user(source):

@@ -4,13 +4,19 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "crab-risk-scan"
-version = "0.1.0"
+version = "0.2.0"
 description = "Offline repository security scanner"
 requires-python = ">=3.10"
 license = {file = "LICENSE"}
+
+[project.optional-dependencies]
+pinch = ["sqlfluff==3.4.2", "tree-sitter==0.25.2"]
 
 [project.scripts]
 crab-risk-scan = "crab_risk_scan.__main__:main"
 
 [tool.setuptools]
 packages = ["crab_risk_scan"]
+
+[tool.setuptools.package-data]
+crab_risk_scan = ["opengrep-v1.yml"]

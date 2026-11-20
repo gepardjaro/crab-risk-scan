@@ -13,6 +13,28 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
+      - name: Build the pinned Mojo grammar for Pinch
+        uses: actions/checkout@v4
+        with:
+          repository: HerringtonDarkholme/tree-sitter-mojo
+          ref: 99fe918e69f087f910ef3b11eba31eb0d7e54edf
+          path: .ci/mojo
+          persist-credentials: false
+      - name: Install trusted parser dependencies
+        run: |
+          python -m pip install '.[pinch]'
+          cc -O2 -fPIC -I.ci/mojo/src -c .ci/mojo/src/parser.c -o "$RUNNER_TEMP/parser.o"
+          c++ -O2 -fPIC -I.ci/mojo/src -c .ci/mojo/src/scanner.cc -o "$RUNNER_TEMP/scanner.o"
+          c++ -shared "$RUNNER_TEMP/parser.o" "$RUNNER_TEMP/scanner.o" -o "$RUNNER_TEMP/mojo.so"
+          echo "CRAB_MOJO_GRAMMAR=$RUNNER_TEMP/mojo.so" >> "$GITHUB_ENV"
+      - name: Install pinned source engines
+        if: matrix.python == '3.13'
+        run: |
+          python -m pip install bandit==1.8.6
+          curl --fail --location --retry 3 https://github.com/opengrep/opengrep/releases/download/v2.0.0/opengrep_linux_x86 -o "$RUNNER_TEMP/opengrep"
+          echo "37e93f4da5fd04a18c5c1febbdd12f7e98dfccd4d0c9cf2593bcb25eeb462da0  $RUNNER_TEMP/opengrep" | sha256sum -c -
+          chmod +x "$RUNNER_TEMP/opengrep"
+          echo "CRAB_OPENGREP=$RUNNER_TEMP/opengrep" >> "$GITHUB_ENV"
       - name: Install the Syft integration-test version
         uses: anchore/sbom-action/download-syft@fbfd9c6c189226748411491745178e0c2017392d
         id: syft
