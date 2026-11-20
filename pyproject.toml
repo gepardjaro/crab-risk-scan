@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "crab-risk-scan"
+version = "0.1.0"
+description = "Offline repository security scanner"
+requires-python = ">=3.10"
+license = {file = "LICENSE"}
+
+[project.scripts]
+crab-risk-scan = "crab_risk_scan.__main__:main"
+
+[tool.setuptools]
+packages = ["crab_risk_scan"]

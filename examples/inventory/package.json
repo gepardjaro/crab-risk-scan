@@ -1,0 +1,8 @@
+{
+  "name": "crab-demo-inventory",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "crab-demo-leaf": "1.0.0"
+  }
+}

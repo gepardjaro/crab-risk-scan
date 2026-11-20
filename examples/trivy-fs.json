@@ -1,0 +1,22 @@
+{
+  "SchemaVersion": 2,
+  "ArtifactType": "filesystem",
+  "Trivy": {
+    "Version": "0.72.0"
+  },
+  "Results": [
+    {
+      "Class": "lang-pkgs",
+      "Type": "npm",
+      "Target": "package-lock.json",
+      "Vulnerabilities": [
+        {
+          "VulnerabilityID": "CRAB-DEMO-001",
+          "PkgName": "crab-demo-leaf",
+          "InstalledVersion": "1.0.0",
+          "Severity": "HIGH"
+        }
+      ]
+    }
+  ]
+}

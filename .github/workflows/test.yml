@@ -1,0 +1,36 @@
+name: Test
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ['3.10', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install the Syft integration-test version
+        uses: anchore/sbom-action/download-syft@fbfd9c6c189226748411491745178e0c2017392d
+        id: syft
+        with:
+          syft-version: v1.32.0
+      - run: python -m unittest discover -s tests -v
+        env:
+          CRAB_TEST_SYFT: ${{ steps.syft.outputs.cmd }}
+      - name: Generate example inventory with the installed CLI
+        if: matrix.python == '3.13'
+        env:
+          SYFT_BIN: ${{ steps.syft.outputs.cmd }}
+        run: |
+          python -m pip install .
+          crab-risk-scan sbom examples/inventory --syft "$SYFT_BIN" --output demo.cdx.json
+      - uses: actions/upload-artifact@v4
+        if: matrix.python == '3.13'
+        with:
+          name: example-cyclonedx-sbom
+          path: demo.cdx.json
+          if-no-files-found: error
