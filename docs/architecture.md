@@ -1,53 +1,53 @@
 # CRAB architecture
 
-CRAB is a local orchestration and reporting CLI. Trusted built-in rules handle two small checks. External engines own package cataloging and broad detection. Their output enters CRAB through explicit adapters.
+CRAB processes one local repository snapshot per invocation. Pinch parses eligible source files. Broad detection stays with established scanner engines. Their saved reports meet at a versioned adapter boundary. Syft generates a separate CycloneDX inventory.
 
 ```mermaid
 flowchart TD
-    S["Repository snapshot"] --> P["Pinch built-in rules"]
-    S --> T["Trivy filesystem scan"]
-    S --> Y["Syft catalogers"]
-    P --> F["Crab Trap findings"]
-    T --> A["Shell report adapter"]
-    A --> F
-    F --> R["Ranked JSON report"]
-    Y --> B["CycloneDX SBOM"]
+  S["Repository snapshot"] --> P["Pinch rules"]
+  S --> E["External scanners"]
+  S --> Y["Syft catalogers"]
+  E --> A["Native JSON adapters"]
+  P --> O["Normalized observations"]
+  A --> O
+  O --> G["Correlation groups"]
+  Y --> B["CycloneDX inventory"]
+  B --> J["Package links"]
+  O --> J
+  O --> T["Threshold and baseline"]
+  G --> R["Crab Trap JSON"]
+  J --> R
+  T --> R
+  T --> F["SARIF and CI status"]
 ```
 
-### Discovery and execution
+## Discovery and execution
 
-`scan` walks regular UTF-8 Python and Dockerfile sources, skips symlinks and common generated directories, and reads at most 1 MiB per file. The Python rule matches the literal call spelling. The Dockerfile check uses the last recognized single-line USER in the final stage. Aliases, inherited users, variable expansion and multiline instructions need stronger parsers. `files_scanned` counts successful built-in checks. Zero eligible files is visible as a zero count.
+The original `scan` command emits schema 1 and retains its Python and Dockerfile behavior. `collect` runs those checks plus its HTML, PostgreSQL and Mojo dispatch and emits an additive schema 2 report. Missing optional parsers and unparseable files count as coverage errors. Each successful source file contributes once to `files_scanned`. Report imports are accounted for separately.
 
-`collect` accepts a local scan and optional saved Trivy schema-2 filesystem reports. The caller supplies reports for the same checkout and revision. CRAB accepts language-package results, rejects other result classes and unsafe paths, and caps input at 16 MiB per report. One invalid report produces a coverage error while valid inputs retain their findings. The adapter selects identity fields and omits free-text descriptions, snippets and scanner diagnostics. A manifest path, line, package name or other identifier is still repository metadata.
+Built-in checks read regular UTF-8 files of up to 1 MiB and skip symlinks and common generated directories. SQLFluff receives SQL text with a fixed PostgreSQL dialect. The Mojo parser loads an explicitly supplied native grammar from outside the target checkout. The CLI never compiles target code. Run the installed CLI outside the target, and run external scanners with trusted settings in an isolated worker. Use a stable read-only snapshot, resource limits and a network policy appropriate for that worker.
 
-`sbom` invokes the trusted Syft binary against a local directory with an explicit source type. The child runs in a temporary directory with a restricted environment, a 180-second timeout and update checks disabled. Syft owns component discovery, package URLs, licenses and dependency relationships when available. CRAB reads up to 32 MiB of generated JSON, checks the document envelope and replaces the requested file after success. The producer's CycloneDX version travels with the document. Inventory can succeed when the findings report is empty.
+The Syft subprocess uses an explicit directory source, a temporary working directory, a restricted environment and a 180-second timeout. CRAB checks the CycloneDX envelope and replaces an output file only after generation succeeds. Its generated or imported inventory limit is 32 MiB. Normal report imports are bounded at 16 MiB each.
 
-Use an immutable, read-only snapshot, a worker without credentials, an enforced network policy and OS resource limits when cataloging untrusted submissions. Process timeouts and bounded report reads cover only part of the worker boundary. Independent scanners and rule packs retain their upstream licenses. Record the exact version, license and checksums before distributing a binary or rule pack with CRAB.
+## Observations, groups and inventory
 
-### Finding model
-
-| Field | Meaning |
+| Entity | Identity and purpose |
 |---|---|
-| producer, producer_version, module | Source of the observation, version if supplied, CRAB capability |
-| rule, message | Upstream advisory or built-in rule ID and curated remediation text |
-| severity, original_severity | Canonical priority and producer's label. Unrecognized labels map to unknown. |
-| path, line | Repository-relative evidence path. A dependency finding has a null line. |
-| package, manifest | For dependency findings, ecosystem, package name, installed version and Trivy target |
-| fingerprint | SHA-256 over an ordered JSON array of identity fields within the snapshot |
+| Import | Ordinal, producer, version, rule pack and status. Direct imports can lack upstream metadata. A run manifest supplies the revision, versions, rule packs and process completion status. |
+| Observation | Producer, rule/advisory, normalized and original severity, location, fingerprint and curated message. Available evidence includes source extent, Bandit confidence, Checkov resource, package metadata or image manifest digest. |
+| Group | A list of observation fingerprints, revision, mapping version and highest recorded severity. A singleton is valid. |
+| Component | A cataloged component in the supplied CycloneDX inventory. Links use the exact package URL and installed version. Each side can contain unmatched records. |
 
-A built-in key uses producer, path, line and rule. A dependency key additionally distinguishes package ecosystem, target, installed location, advisory, name and installed version. Re-importing the same observation is idempotent. For conflicting severities the highest known severity wins. Sort order is critical, high, medium, low, unknown, followed by path, line, rule and fingerprint. This initial priority is independent of exploitability or reachability.
+Exact duplicates within a producer share an observation. Import indices retain their provenance. Ranking uses severity first and stable identity fields for tie-breaking. When duplicate severities disagree, the highest severity takes precedence. Rule equivalence map v1 connects CRAB-PY-001 and Bandit B323 only when both reports describe the same file and complete byte extent. Colocated findings with different spans remain independent.
 
-For future cross-engine correlation, preserve each observation and form a separate group. Resolve explicit CVE/GHSA aliases and require the same package URL, version and artifact or manifest. A source finding needs a curated rule equivalence and matching source span. Shared CWEs and matching line numbers alone are insufficient. Keep image digest, commit identity and normalization-map version in the group. Link SBOM components by package URL and version while retaining unmatched inventory and advisories.
+Dependency grouping requires the same versioned package URL, installed version and artifact scope. Within that scope, equal advisory IDs and explicit OSV aliases connect transitively. CRAB derives URLs for familiar package ecosystems when the scanner omitted one. Unknown ecosystems need an explicit URL for correlation. Filesystem findings are scoped to their manifest. Image findings include a validated sha256 digest, and image-internal locations never become checkout annotations. The optional repository SBOM joins repository findings only.
 
-### Delivery and compatibility
+The repository revision is caller-supplied. CRAB does not authenticate a report or attest the snapshot associated with a standalone SBOM. Generate and retain inputs together in CI. The mapping version and revision in each group make repeated comparisons interpretable.
 
-The starter's source-scan JSON remains schema 1. Combined reports use schema 2; consumers can migrate independently. CLI and import identifiers changed from `crab` to `crab-risk-scan` and `crab_risk_scan` to avoid namespace collisions.
+## Reporting and policy
 
-| Milestone | Acceptance |
-|---|---|
-| Local scanner, unified report and SBOM (this release) | Verify clean/finding/incomplete statuses, atomic output, repeat import, unknown severity, canary redaction and a clean dependency in a real Syft inventory. |
-| Broad integrations | Follow the per-language fixtures and parser gates in [the coverage matrix](coverage.md). Require producer version, completion status and rule-pack provenance. |
-| Cross-engine triage | Preserve evidence under conservative group keys. Export findings with valid file locations to SARIF 2.1.0 and link component identities to CycloneDX. |
-| Policy and baselines | Add explicit severity thresholds and reviewed suppressions. Preserve incomplete-scan precedence, even if all findings are suppressed. |
+`collect --format sarif` exports SARIF 2.1.0 from observations, with repository-relative URI-encoded locations, available line ranges and stable partial fingerprints. Image-only findings retain their advisory and severity. The run invocation carries coverage failures. JSON additionally exposes groups, input provenance and inventory joins.
 
-[Trivy reporting](https://trivy.dev/docs/v0.72/guide/configuration/reporting/) · [Syft](https://github.com/anchore/syft) · [CycloneDX JSON reference](https://cyclonedx.org/docs/1.6/json/)
+Reviewed baseline entries target exact observation fingerprints and contain a reviewer and reason. Matching findings stay visible and are marked suppressed. Severity thresholds apply to remaining observations. Exit 2 has precedence over both findings and suppressions, exit 1 indicates actionable observations, and exit 0 indicates the specified policy passed within measured coverage.
+
+[Native report formats and commands](integrations.md) · [Language coverage](coverage.md) · [SARIF specification](https://docs.oasis-open.org/sarif/sarif/v2.1.0/sarif-v2.1.0.html)
