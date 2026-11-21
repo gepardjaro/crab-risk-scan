@@ -1,0 +1,14 @@
+.git
+.github
+.agents
+.venv
+**/__pycache__
+**/*.py[cod]
+*.egg-info
+build
+dist
+tests
+web/node_modules
+web/dist
+crab-results
+**/.DS_Store
