@@ -28,12 +28,14 @@ class ProjectCreate(Body):
     name: str = Field(min_length=1, max_length=200)
     repository_url: str | None = None
     default_branch: str | None = Field(None, max_length=256)
+    scan_path: str | None = Field(None, max_length=4096)
 
 
 class ProjectPatch(Body):
     name: str | None = Field(None, min_length=1, max_length=200)
     repository_url: str | None = None
     default_branch: str | None = Field(None, max_length=256)
+    scan_path: str | None = Field(None, max_length=4096)
 
 
 class MemberBody(Body):
@@ -69,8 +71,9 @@ class SchedulePatch(Body):
 
 def project_item(db, principal, project, latest=None):
     return {"id": project.id, "key": project.key, "name": project.name, "repository_url": project.repository_url,
-            "default_branch": project.default_branch, "created_at": iso(project.created_at),
-            "role": project_role(db, principal, project), "latest_scan": latest}
+            "default_branch": project.default_branch, "scan_path": project.scan_path,
+            "created_at": iso(project.created_at), "role": project_role(db, principal, project),
+            "latest_scan": latest}
 
 
 def check_repository(url):
@@ -79,23 +82,35 @@ def check_repository(url):
     return url
 
 
-async def read_json(request, limit):
-    """Read a JSON object body, answering 413 as soon as it exceeds `limit` bytes."""
-    length = request.headers.get("content-length")
-    if length and length.isdigit() and int(length) > limit:
-        raise ApiError(413, "request body too large")
-    body = bytearray()
-    async for chunk in request.stream():
-        body += chunk
-        if len(body) > limit:
-            raise ApiError(413, "request body too large")
+def reject_constant(name):
+    raise ValueError(f"{name} is not valid JSON")
+
+
+def parse_json(body):
+    """Strict JSON object parsing: NaN, Infinity and -Infinity are rejected."""
     try:
-        data = json.loads(body)
+        data = json.loads(body, parse_constant=reject_constant)
     except (ValueError, RecursionError):
         raise ApiError(400, "request body must be JSON") from None
     if not isinstance(data, dict):
         raise ApiError(422, "request body must be a JSON object")
     return data
+
+
+async def read_json(request, limit):
+    """Read a JSON object body, answering 413 as soon as it exceeds `limit` bytes. Callers authorize
+    first. A small pool of slots bounds how many large bodies are buffered and parsed at once, and
+    parsing runs in the threadpool so it never blocks the event loop."""
+    length = request.headers.get("content-length")
+    if length and length.isdigit() and int(length) > limit:
+        raise ApiError(413, "request body too large")
+    async with request.app.state.body_slots:
+        body = bytearray()
+        async for chunk in request.stream():
+            body += chunk
+            if len(body) > limit:
+                raise ApiError(413, "request body too large")
+        return await run_in_threadpool(parse_json, body)
 
 
 def body_limit(settings):
@@ -116,14 +131,16 @@ def list_projects(paging: Paging = Depends(), db=Depends(get_db), principal: Pri
 
 
 @router.post("/projects", status_code=201)
-def create_project(body: ProjectCreate, db=Depends(get_db), principal: Principal = Depends(get_principal)):
+def create_project(body: ProjectCreate, request: Request, db=Depends(get_db),
+                   principal: Principal = Depends(get_principal)):
     require_admin(principal)
     if not PROJECT_KEY.fullmatch(body.key):
         raise ApiError(422, "key must be 1-64 lowercase letters, digits, '.', '_' or '-'")
     if db.scalar(select(Project).where(Project.key == body.key)):
         raise ApiError(409, "project key already exists")
     project = Project(key=body.key, name=body.name.strip(), repository_url=check_repository(body.repository_url),
-                      default_branch=body.default_branch or None)
+                      default_branch=body.default_branch or None,
+                      scan_path=service.validate_scan_path(body.scan_path, request.app.state.settings.scan_roots))
     db.add(project)
     db.commit()
     return project_item(db, principal, project)
@@ -141,7 +158,8 @@ def get_project(key: str, db=Depends(get_db), principal: Principal = Depends(get
 
 
 @router.patch("/projects/{key}")
-def update_project(key: str, body: ProjectPatch, db=Depends(get_db), principal: Principal = Depends(get_principal)):
+def update_project(key: str, body: ProjectPatch, request: Request, db=Depends(get_db),
+                   principal: Principal = Depends(get_principal)):
     require_session(principal)
     project = load_project(db, principal, key, "maintainer")
     fields = body.model_fields_set
@@ -153,6 +171,10 @@ def update_project(key: str, body: ProjectPatch, db=Depends(get_db), principal: 
         project.repository_url = check_repository(body.repository_url or None)
     if "default_branch" in fields:
         project.default_branch = body.default_branch or None
+    if "scan_path" in fields:
+        if not principal.is_admin:
+            raise ApiError(403, "only admins can change the scan path")
+        project.scan_path = service.validate_scan_path(body.scan_path, request.app.state.settings.scan_roots)
     project.updated_at = utcnow()
     db.commit()
     return project_item(db, principal, project, latest_summary(db, project))
@@ -230,8 +252,14 @@ def delete_member(key: str, user_id: int, db=Depends(get_db), principal: Princip
 
 # Scans ----------------------------------------------------------------------------------------
 
-def store_upload(db, principal, key, body, settings, base_url):
+def authorize_upload(db, principal, key):
+    """Authorize before the body is read; the transaction ends so no lock is held while it streams."""
     project = load_project(db, principal, key, "maintainer", upload=True)
+    db.commit()
+    return project
+
+
+def store_upload(db, project, body, settings, base_url):
     unknown = set(body) - {"report", "sbom", "source", "ci"}
     if unknown:
         raise ApiError(422, "unknown upload fields: " + ", ".join(sorted(unknown)))
@@ -256,8 +284,9 @@ def store_upload(db, principal, key, body, settings, base_url):
 @router.post("/projects/{key}/scans", status_code=201)
 async def upload_scan(key: str, request: Request, db=Depends(get_db), principal: Principal = Depends(get_principal)):
     settings = request.app.state.settings
+    project = await run_in_threadpool(authorize_upload, db, principal, key)
     body = await read_json(request, body_limit(settings))
-    return await run_in_threadpool(store_upload, db, principal, key, body, settings, str(request.base_url))
+    return await run_in_threadpool(store_upload, db, project, body, settings, str(request.base_url))
 
 
 @router.get("/projects/{key}/scans")
@@ -330,8 +359,10 @@ def create_job(key: str, body: JobBody, request: Request, db=Depends(get_db),
     require_session(principal)
     settings = request.app.state.settings
     project = load_project(db, principal, key, "maintainer")
-    source = service.validate_source(body.source, settings.scan_roots)
+    source = service.validate_source(body.source, settings, scan_path=project.scan_path,
+                                     confined=not principal.is_admin)
     options = service.validate_options(body.options)
+    service.check_queue_capacity(db, project.id)
     job = service.new_job(project.id, source, options, settings)
     db.add(job)
     db.commit()
@@ -366,8 +397,10 @@ def create_schedule(key: str, body: ScheduleCreate, request: Request, db=Depends
     settings = request.app.state.settings
     project = load_project(db, principal, key, "maintainer")
     cron = service.parse_cron(body.cron)
-    schedule = Schedule(project_id=project.id, cron=cron.text,
-                        source=service.validate_source(body.source, settings.scan_roots),
+    source = service.validate_source(body.source, settings, scan_path=project.scan_path,
+                                     confined=not principal.is_admin)
+    service.check_schedule_capacity(db, project.id)
+    schedule = Schedule(project_id=project.id, cron=cron.text, source=source, admin_source=principal.is_admin,
                         options=service.validate_options(body.options), enabled=body.enabled,
                         next_run_at=cron.next_after(utcnow()) if body.enabled else None)
     db.add(schedule)
@@ -399,7 +432,9 @@ def update_schedule(schedule_id: int, body: SchedulePatch, request: Request, db=
         schedule.cron = service.parse_cron(body.cron).text
         reschedule = True
     if "source" in fields and body.source is not None:
-        schedule.source = service.validate_source(body.source, settings.scan_roots)
+        schedule.source = service.validate_source(body.source, settings, scan_path=project.scan_path,
+                                                  confined=not principal.is_admin)
+        schedule.admin_source = principal.is_admin
     if "options" in fields:
         schedule.options = service.validate_options(body.options)
     if "enabled" in fields and body.enabled is not None:

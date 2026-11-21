@@ -2,6 +2,7 @@
 
 Standard library only, so the stock scanner image can run workers without server dependencies.
 """
+import ipaddress
 import json
 import os
 import re
@@ -19,6 +20,8 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from . import __version__
+from .server.config import parse_git_hosts
+from .server.safety import blocked_address, host_allowed, unc_or_device, within
 
 LOG_LIMIT = 64 * 1024
 ERROR_LIMIT = 2000
@@ -28,6 +31,26 @@ COMMIT = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 ENGINES = re.compile(r"auto|all|none|[a-z][a-z-]{0,31}(,[a-z][a-z-]{0,31}){0,15}")
 LEVELS = ("critical", "high", "medium", "low", "info", "unknown", "none")
 NAME = re.compile(r"[^A-Za-z0-9._-]+")
+# Applied to every git command: no credential helpers, redirects, LFS filters, submodules, hooks
+# or protocols other than http(s).
+GIT_SAFE_CONFIG = ("credential.helper=", "http.followRedirects=false", "filter.lfs.smudge=", "filter.lfs.process=",
+                   "filter.lfs.required=false", "submodule.recurse=false", "protocol.allow=never",
+                   "protocol.http.allow=always", "protocol.https.allow=always", "core.symlinks=false",
+                   "core.fsmonitor=false", "core.hooksPath=" + os.devnull)
+# Job logs carry a category, never raw git stderr (it can echo URLs, hosts and server messages).
+GIT_FAILURES = (
+    ("timed out", ("timed out", "timeout")),
+    ("reference not found", ("couldn't find remote ref", "not our ref", "unknown revision", "invalid refspec",
+                             "no such ref", "pathspec")),
+    ("authentication required or repository not found", ("could not read username", "could not read password",
+                                                          "authentication", "terminal prompts disabled",
+                                                          "repository not found", "not found",
+                                                          "returned error: 401", "returned error: 403",
+                                                          "returned error: 404")),
+    ("could not connect", ("could not resolve", "failed to connect", "couldn't connect", "connection refused",
+                           "connection reset", "network is unreachable", "unable to access", "ssl", "tls",
+                           "redirect")),
+)
 
 
 class ServerError(Exception):
@@ -53,6 +76,27 @@ def http_url(value):
 
 def tail(text, limit=LOG_LIMIT):
     return text[-limit:]
+
+
+def git_failure(stderr, code):
+    """Map git stderr to a fixed category."""
+    text = (stderr or "").lower()
+    for category, needles in GIT_FAILURES:
+        if any(needle in text for needle in needles):
+            return category
+    return f"git failed with status {code}"
+
+
+def git_environment(home):
+    """Minimal environment for git: no inherited credentials, proxies, config or prompts."""
+    env = {"PATH": os.environ.get("PATH", os.defpath), "HOME": str(home), "GIT_CONFIG_NOSYSTEM": "1",
+           "GIT_CONFIG_GLOBAL": os.devnull, "GIT_TERMINAL_PROMPT": "0", "GIT_LFS_SKIP_SMUDGE": "1",
+           "GIT_ALLOW_PROTOCOL": "http:https"}
+    if os.name == "nt":
+        for name in ("SYSTEMROOT", "TEMP", "TMP"):
+            if os.environ.get(name):
+                env[name] = os.environ[name]
+    return env
 
 
 class Client:
@@ -122,11 +166,12 @@ class Heartbeat(threading.Thread):
 
 
 class Worker:
-    def __init__(self, client, name, *, allow_git=False, scan_roots=(), timeout=3600, stream=None):
+    def __init__(self, client, name, *, allow_git=False, scan_roots=(), git_hosts=(), timeout=3600, stream=None):
         self.client = client
         self.name = name
         self.allow_git = allow_git
         self.scan_roots = tuple(scan_roots)
+        self.git_hosts = tuple(git_hosts)
         self.timeout = timeout
         self.stream = stream or sys.stderr
 
@@ -141,16 +186,52 @@ class Worker:
     # Sources ----------------------------------------------------------------------------------
 
     def resolve_path(self, path):
+        """Lexical checks first (UNC/device paths, containment), realpath only afterwards, so a
+        job can never make the worker open a network path."""
         if not self.scan_roots:
             raise JobError("path sources are disabled on this worker; pass --scan-root or set CRAB_SCAN_ROOTS")
-        if not isinstance(path, str) or not os.path.isabs(path):
+        if not isinstance(path, str) or not path or "\x00" in path:
             raise JobError("source path must be absolute")
+        if unc_or_device(path):
+            raise JobError("source path must not be a UNC or device path")
+        if not os.path.isabs(path):
+            raise JobError("source path must be absolute")
+        if not any(within(path, root) for root in self.scan_roots):
+            raise JobError("source path is outside this worker's scan roots")
         real = Path(os.path.realpath(path))
-        if not any(real == root or real.is_relative_to(root) for root in self.scan_roots):
+        if not any(within(str(real), root) for root in self.scan_roots):
             raise JobError("source path is outside this worker's scan roots")
         if not real.is_dir():
             raise JobError("source path is not a directory on this worker")
         return real
+
+    def git_target(self, parts):
+        """Check the host against --git-host, resolve it once and return the curl resolve entry
+        that pins git to the checked address. Every resolved address must be public."""
+        try:
+            port = parts.port
+        except ValueError:
+            raise JobError("git source URL has an invalid port") from None
+        default = 443 if parts.scheme == "https" else 80
+        host = parts.hostname
+        if self.git_hosts and not host_allowed(host, port, default, self.git_hosts):
+            raise JobError("git host is not allowed by this worker's --git-host list")
+        port = port or default
+        try:
+            infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        except (OSError, UnicodeError):
+            raise JobError("git fetch failed: could not connect") from None
+        addresses = []
+        for info in infos:
+            try:
+                addresses.append(ipaddress.ip_address(info[4][0].split("%")[0]))
+            except ValueError:
+                continue
+        if not addresses or any(blocked_address(address) for address in addresses):
+            raise JobError("git host resolves to a loopback, link-local, multicast or reserved address")
+        address = addresses[0]
+        pinned = f"[{address}]" if address.version == 6 else str(address)
+        return f"{host}:{port}:{pinned}"
 
     def checkout(self, url, ref, directory, heartbeat):
         if not self.allow_git:
@@ -163,26 +244,29 @@ class Worker:
         git = shutil.which("git")
         if git is None:
             raise JobError("git is not installed on this worker")
-        env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_ASKPASS="", GCM_INTERACTIVE="never")
-        safe = ["-c", "protocol.file.allow=never", "-c", "protocol.ext.allow=never", "-c", "core.symlinks=false",
-                "-c", "core.fsmonitor=false", "-c", "core.hooksPath=" + os.devnull]
-        steps = [[git, "init", "--quiet", str(directory)],
-                 [git, "-C", str(directory), *safe, "fetch", "--depth", "1", "--no-tags", "--quiet", "--", url,
-                  ref or "HEAD"],
-                 [git, "-C", str(directory), *safe, "checkout", "--quiet", "--detach", "FETCH_HEAD"]]
-        for step in steps:
+        resolve = self.git_target(parts)
+        home = Path(directory).parent / "git-home"
+        home.mkdir(exist_ok=True)
+        env = git_environment(home)
+        safe = []
+        for setting in (*GIT_SAFE_CONFIG, "http.curloptResolve=" + resolve):
+            safe += ["-c", setting]
+        steps = [("init", [git, *safe, "init", "--quiet", str(directory)]),
+                 ("fetch", [git, "-C", str(directory), *safe, "fetch", "--depth", "1", "--no-tags", "--quiet",
+                            "--", url, ref or "HEAD"]),
+                 ("checkout", [git, "-C", str(directory), *safe, "checkout", "--quiet", "--detach", "FETCH_HEAD"])]
+        for name, step in steps:
             if heartbeat.cancelled.is_set():
                 raise JobError("cancelled")
             try:
                 result = subprocess.run(step, env=env, capture_output=True, text=True, errors="replace",
                                         timeout=GIT_TIMEOUT, stdin=subprocess.DEVNULL)
             except subprocess.TimeoutExpired:
-                raise JobError("git checkout timed out") from None
+                raise JobError(f"git {name} failed: timed out") from None
             if result.returncode != 0:
-                raise JobError(f"git {step[3] if step[1] == '-C' else step[1]} failed with status {result.returncode}",
-                               tail(result.stderr))
-        revision = subprocess.run([git, "-C", str(directory), "rev-parse", "HEAD"], capture_output=True, text=True,
-                                  timeout=60, stdin=subprocess.DEVNULL).stdout.strip()
+                raise JobError(f"git {name} failed: {git_failure(result.stderr, result.returncode)}")
+        revision = subprocess.run([git, "-C", str(directory), *safe, "rev-parse", "HEAD"], env=env,
+                                  capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL).stdout.strip()
         return revision if COMMIT.fullmatch(revision) else None
 
     # Scan -------------------------------------------------------------------------------------
@@ -329,6 +413,9 @@ def add_arguments(parser):
     parser.add_argument("--allow-git", action="store_true", help="accept jobs that clone git repositories")
     parser.add_argument("--scan-root", action="append", default=[], type=Path, metavar="DIR",
                         help="directory that path sources must resolve inside (repeatable; default: CRAB_SCAN_ROOTS)")
+    parser.add_argument("--git-host", action="append", default=[], metavar="HOST[:PORT]",
+                        help="host that git sources must use (repeatable; default: CRAB_GIT_HOSTS; "
+                             "no restriction beyond the address checks when empty)")
     parser.add_argument("--timeout", type=int, default=3600, metavar="SECONDS",
                         help="maximum duration of one scan subprocess (default 3600)")
 
@@ -358,11 +445,12 @@ def run(args):
         return 2
     try:
         roots = scan_roots(args.scan_root)
+        git_hosts = parse_git_hosts(",".join(args.git_host) if args.git_host else os.environ.get("CRAB_GIT_HOSTS"))
     except ValueError as exc:
         print(f"worker: {exc}", file=sys.stderr)
         return 2
     worker = Worker(Client(args.server, token), name, allow_git=args.allow_git, scan_roots=roots,
-                    timeout=max(1, args.timeout))
+                    git_hosts=git_hosts, timeout=max(1, args.timeout))
     stopping = threading.Event()
     if threading.current_thread() is threading.main_thread():
         def stop(signum, _frame):

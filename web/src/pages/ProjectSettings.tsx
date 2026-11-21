@@ -8,13 +8,14 @@ import { Can, Empty, ErrorMessage, Loading, Notice, confirmAction, useAction } f
 import { formatDate } from "../lib/format";
 import { useAsync } from "../lib/useAsync";
 
-function Details() {
+export function Details() {
   const { project, canMaintain, reloadProject } = useProject();
   const { api, isAdmin } = useAuth();
   const navigate = useNavigate();
   const [name, setName] = useState(project.name);
   const [repository, setRepository] = useState(project.repository_url ?? "");
   const [branch, setBranch] = useState(project.default_branch ?? "");
+  const [scanPath, setScanPath] = useState(project.scan_path ?? "");
   const [notice, setNotice] = useState("");
   const save = useAction();
   const remove = useAction();
@@ -22,7 +23,13 @@ function Details() {
   async function submit(event: FormEvent) {
     event.preventDefault();
     const saved = await save.run(() =>
-      api.updateProject(project.key, { name: name.trim(), repository_url: repository.trim() || null, default_branch: branch.trim() || null }),
+      api.updateProject(project.key, {
+        name: name.trim(),
+        repository_url: repository.trim() || null,
+        default_branch: branch.trim() || null,
+        // Only admins may change the scan path; the server answers 403 to anyone else sending it.
+        ...(isAdmin ? { scan_path: scanPath.trim() || null } : {}),
+      }),
     );
     if (saved) {
       setNotice("Project saved.");
@@ -51,6 +58,17 @@ function Details() {
         <label className="field">
           <span>Default branch</span>
           <input value={branch} disabled={!canMaintain} onChange={(e) => setBranch(e.target.value)} />
+        </label>
+        <label className="field">
+          <span>Scan path</span>
+          <input
+            maxLength={4096}
+            placeholder={isAdmin ? "Absolute path inside a server scan root" : "Not set"}
+            value={scanPath}
+            disabled={!isAdmin}
+            onChange={(e) => setScanPath(e.target.value)}
+          />
+          <small className="muted">Path jobs and schedules created by non-admins must stay inside this directory. Only administrators can change it.</small>
         </label>
         <Can allowed={canMaintain}>
           <div className="form-actions">

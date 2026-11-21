@@ -17,7 +17,7 @@ The WebUI is a single-page application for the CRAB server. It lives in `web/` (
 | `/projects/:key/exceptions` | Exceptions | Lists, edits and deletes exceptions, and downloads the exceptions v2 export for CI. |
 | `/projects/:key/jobs` | Jobs | A run form for a server path or git source, with engines, SBOM and fail-on options, and the project's job list. The list refreshes every 3 seconds while a job is queued or running. |
 | `/projects/:key/schedules` | Schedules | Creates, edits, enables, disables and deletes cron schedules, with the next and last run in UTC. |
-| `/projects/:key/settings` | Project settings | Project details, members and roles, and project tokens. A new token's secret is shown once. |
+| `/projects/:key/settings` | Project settings | Project details, members and roles, and project tokens. The scan path is editable by administrators and shown read-only to maintainers. A new token's secret is shown once. |
 | `/admin/users` | Users | Creates, edits, deactivates and deletes users. |
 | `/admin/tokens` | Service tokens | Worker, upload and read tokens, either global or bound to a project. A new token's secret is shown once. |
 | `/admin/workers` | Workers and job queue | Worker state and capabilities, plus the job queue for every project with status and project filters. The page refreshes every 5 seconds. |

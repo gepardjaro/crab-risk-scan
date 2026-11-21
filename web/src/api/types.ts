@@ -228,6 +228,8 @@ export interface Project {
   name: string;
   repository_url?: string | null;
   default_branch?: string | null;
+  /** Admin-set directory that non-admin path jobs and schedules must stay inside. */
+  scan_path?: string | null;
   latest_scan?: ScanSummary | null;
   role?: "admin" | ProjectRole | null;
 }
@@ -237,6 +239,7 @@ export interface ProjectInput {
   name: string;
   repository_url?: string | null;
   default_branch?: string | null;
+  scan_path?: string | null;
 }
 
 export interface Member {

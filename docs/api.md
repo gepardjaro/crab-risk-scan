@@ -1,19 +1,20 @@
 # API reference
 
-The base path is `/api/v1`. Requests and responses use JSON. Authenticate with `Authorization: Bearer <token>`, using a session token from `POST /auth/login` or an API token. Timestamps are ISO 8601 UTC strings ending in `Z`. Errors use `{"detail": "..."}`. The running server also publishes OpenAPI at `/api/openapi.json` and interactive docs at `/api/docs`.
+The base path is `/api/v1`. Requests and responses use JSON. Authenticate with `Authorization: Bearer <token>`, using a session token from `POST /auth/login` or an API token. Timestamps are ISO 8601 UTC strings ending in `Z`. Errors use `{"detail": "..."}`. With `CRAB_API_DOCS=1` the server also publishes OpenAPI at `/api/openapi.json` and interactive docs at `/api/docs`; both are disabled by default.
 
-List endpoints return `{"items": [...], "total": n}` and accept `page` (default 1) and `page_size` (default 50, maximum 500).
+List endpoints return `{"items": [...], "total": n}` and accept `page` (default 1, maximum 100000) and `page_size` (default 50, maximum 500).
 
 | Status | Meaning |
 |---|---|
-| 400 | Body is not JSON |
+| 400 | Body is not JSON, or contains `NaN` or `Infinity` |
 | 401 | Missing, invalid or expired credentials |
 | 403 | Authenticated, but the role or token scope is insufficient |
 | 404 | Not found, or not visible to the caller |
 | 409 | Conflict: duplicate name, last admin, job not held by this worker, job already finished |
 | 413 | Request body, report or SBOM larger than 32 MiB |
 | 422 | Validation failure |
-| 429 | Sign-in temporarily locked; see `Retry-After` |
+| 429 | Sign-in temporarily locked for the account or the client address; see `Retry-After` |
+| 503 | Password hashing is saturated (sign-in, user creation, password change); see `Retry-After` |
 | 501 | Report format needs an optional dependency that is not installed |
 
 ## Authentication and users
@@ -46,16 +47,16 @@ Token: `{id, name, scopes, project: KEY|null, prefix, created_by, created_at, la
 | Method and path | Body | Response | Permission |
 |---|---|---|---|
 | GET /projects | | Project items with `latest_scan` | visible projects |
-| POST /projects | `{key, name, repository_url?, default_branch?}` | 201 Project | admin |
+| POST /projects | `{key, name, repository_url?, default_branch?, scan_path?}` | 201 Project | admin |
 | GET /projects/{key} | | Project | viewer |
-| PATCH /projects/{key} | any of `{name, repository_url, default_branch}` | Project | maintainer |
+| PATCH /projects/{key} | any of `{name, repository_url, default_branch, scan_path}` | Project | maintainer; `scan_path` admin only (403 otherwise) |
 | DELETE /projects/{key} | | 204 | admin |
 | GET /projects/{key}/members | | `{user_id, username, role}` items | maintainer |
 | GET /projects/{key}/candidates?q=TEXT | | `{items: [{id, username}]}`, active users by case-insensitive prefix, at most 20 | maintainer |
 | PUT /projects/{key}/members/{user_id} | `{role: "maintainer"\|"viewer"}` | Member | maintainer |
 | DELETE /projects/{key}/members/{user_id} | | 204 | maintainer |
 
-Project: `{id, key, name, repository_url, default_branch, created_at, role, latest_scan}`. `role` is the caller's effective role: `admin`, `maintainer`, `viewer` or null. Keys are 1 to 64 characters of lowercase letters, digits, `.`, `_` and `-`.
+Project: `{id, key, name, repository_url, default_branch, scan_path, created_at, role, latest_scan}`. `role` is the caller's effective role: `admin`, `maintainer`, `viewer` or null. Keys are 1 to 64 characters of lowercase letters, digits, `.`, `_` and `-`. `scan_path` is an absolute directory inside `CRAB_SCAN_ROOTS`, or null; an empty value clears it.
 
 ## Scans
 
@@ -103,7 +104,7 @@ Exception: `{fingerprint, status, justification, reason, reviewer, expires, tick
 | POST /jobs/{id}/fail | `{error, log?, worker?}` | `{id, status}` | `worker` token holding the lease |
 | GET /workers | | `{name, last_seen_at, current_job, active, capabilities}` items | admin |
 
-Job: `{id, project, status: "queued"|"running"|"succeeded"|"failed"|"cancelled", source, options, worker, attempts, created_at, started_at, finished_at, scan_id, error, schedule_id}`. Claimed jobs also carry the project's `repository_url`. Path sources must be absolute and resolve inside `CRAB_SCAN_ROOTS`. Git URLs must be http or https without credentials. A complete call with an invalid report fails the job and answers 422. Logs keep the last 64 KiB.
+Job: `{id, project, status: "queued"|"running"|"succeeded"|"failed"|"cancelled", source, options, worker, attempts, created_at, started_at, finished_at, scan_id, error, schedule_id}`. Claimed jobs also carry the project's `repository_url`. Path sources must be absolute, not UNC or device paths, and inside `CRAB_SCAN_ROOTS`. Non-admin callers must also stay inside the project's `scan_path`; without one, their path sources answer 422. Git URLs must be http or https without credentials, and their host must be listed in `CRAB_GIT_HOSTS` (otherwise 422). A project holds at most 100 queued jobs. The server authorizes an upload before reading its body. A complete call with an invalid report fails the job and answers 422. Logs keep the last 64 KiB. Any `worker` token can claim any project's job.
 
 ## Schedules
 
@@ -114,7 +115,7 @@ Job: `{id, project, status: "queued"|"running"|"succeeded"|"failed"|"cancelled",
 | PATCH /schedules/{id} | any of `{cron, source, options, enabled}` | Schedule | maintainer session |
 | DELETE /schedules/{id} | | 204 | maintainer session |
 
-Schedule: `{id, project, cron, source, options, enabled, next_run_at, last_run_at, last_job_id, created_at}`. Cron expressions have five fields evaluated in UTC. Disabled schedules have a null `next_run_at`.
+Schedule: `{id, project, cron, source, options, enabled, next_run_at, last_run_at, last_job_id, created_at}`. Cron expressions have five fields evaluated in UTC. Disabled schedules have a null `next_run_at`. Sources follow the job rules for the caller who set them, and are checked again at every run. A project holds at most 50 schedules.
 
 ## Dashboards
 

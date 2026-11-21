@@ -5,9 +5,11 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from datetime import timedelta
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "tests" / "fixtures" / "report-v3.json"
@@ -17,11 +19,12 @@ PASSWORD = "member-password-1"
 
 try:
     from fastapi.testclient import TestClient
-    from sqlalchemy import update
+    from sqlalchemy import select, update
 
+    from crab_risk_scan.server import api_auth, api_projects, cli, service
     from crab_risk_scan.server.app import bootstrap_admin, create_app
-    from crab_risk_scan.server.config import UPLOAD_LIMIT, Settings
-    from crab_risk_scan.server.db import Job, SessionToken, utcnow
+    from crab_risk_scan.server.config import UPLOAD_LIMIT, Settings, parse_git_hosts
+    from crab_risk_scan.server.db import ApiToken, Job, LoginFailure, Schedule, SessionToken, utcnow
 except ImportError as exc:  # the server extra is optional
     raise unittest.SkipTest(f"server extra not installed: {exc.name}")
 
@@ -466,6 +469,8 @@ class FindingTests(ServerCase):
 
 
 class JobTests(ServerCase):
+    settings_overrides = {"git_hosts": (("example.com", None),)}
+
     def setUp(self):
         super().setUp()
         self.project()
@@ -683,6 +688,349 @@ class WebUiTests(ServerCase):
         self.assertEqual(self.client.get("/api/v1/unknown").status_code, 404)
 
 
+UNC_PATHS = ("\\\\attacker.example\\share\\repo", "//attacker.example/share/repo", "\\\\?\\UNC\\attacker\\share",
+             "\\\\.\\pipe\\crab", "\\\\?\\C:\\repos", "/\\attacker\\share")
+
+
+def realpath_guard():
+    """Patch os.path.realpath so that resolving a UNC or device path fails the test."""
+    original = os.path.realpath
+
+    def guarded(path, *args, **kwargs):
+        text = os.fspath(path)
+        if len(text) >= 2 and text[0] in "\\/" and text[1] in "\\/":
+            raise AssertionError(f"realpath called for {text!r}")
+        return original(path, *args, **kwargs)
+    return mock.patch("os.path.realpath", side_effect=guarded)
+
+
+class UploadAuthorizationTests(ServerCase):
+    """F7 and F5: authorize before reading, parse off the event loop, reject NaN and Infinity."""
+    settings_overrides = {"upload_limit": 64 * 1024}
+
+    def test_outsider_is_rejected_before_the_body_is_read(self):
+        self.project()
+        _, outsider = self.user("outsider")
+        payload = b'{"report": "' + b"x" * (3 * 64 * 1024) + b'"}'
+        response = self.client.post("/api/v1/projects/demo/scans", content=payload,
+                                    headers={"Authorization": f"Bearer {outsider}",
+                                             "content-type": "application/json"})
+        self.assertEqual(response.status_code, 404)
+        with mock.patch.object(api_projects, "read_json", side_effect=AssertionError("body read")):
+            denied = self.call("POST", "/projects/demo/scans", outsider, json={"report": fixture()})
+        self.assertEqual(denied.status_code, 404)
+
+    def test_body_is_parsed_in_the_threadpool(self):
+        self.project()
+        seen = []
+        original = api_projects.parse_json
+
+        def parse(body):
+            import asyncio
+            try:
+                asyncio.get_running_loop()
+                seen.append("event loop")
+            except RuntimeError:
+                seen.append("thread")
+            return original(body)
+        with mock.patch.object(api_projects, "parse_json", side_effect=parse):
+            self.upload()
+        self.assertEqual(seen, ["thread"])
+        self.assertEqual(self.app.state.body_slots.value, 2)
+
+    def test_nan_and_infinity_are_rejected(self):
+        self.project()
+        for constant in ("NaN", "Infinity", "-Infinity"):
+            with self.subTest(constant=constant):
+                body = json.dumps({"report": fixture()})[:-1] + f', "ci": {{"platform": {constant}}}}}'
+                response = self.client.post("/api/v1/projects/demo/scans", content=body.encode(),
+                                            headers={"Authorization": f"Bearer {self.admin}",
+                                                     "content-type": "application/json"})
+                self.assertEqual(response.status_code, 400, response.text)
+        worker = self.token(["worker"])
+        self.ok("POST", "/projects/demo/jobs", status=201,
+                json={"source": {"type": "path", "path": str(self.repos / "demo")}})
+        job = self.ok("POST", "/workers/claim", worker, json={"worker": "w1"})["job"]
+        body = json.dumps({"report": fixture()})[:-1] + ', "log": NaN}'
+        response = self.client.post(f"/api/v1/jobs/{job['id']}/complete", content=body.encode(),
+                                    headers={"Authorization": f"Bearer {worker}", "content-type": "application/json"})
+        self.assertEqual(response.status_code, 400)
+
+
+class LoginThrottleTests(ServerCase):
+    """F8: atomic reservation, per-client bucket, bounded hashing, admin recovery."""
+
+    def wrong(self, username, password="wrong-password-1"):
+        return self.client.post("/api/v1/auth/login", json={"username": username, "password": password})
+
+    def test_concurrent_failures_never_exceed_the_limit(self):
+        self.user("grace")
+        attempts = 12
+        barrier = threading.Barrier(attempts)
+        codes = []
+
+        def attempt():
+            barrier.wait()
+            codes.append(self.wrong("grace").status_code)
+        threads = [threading.Thread(target=attempt) for _ in range(attempts)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(120)
+        self.assertEqual(sorted(codes), [401] * self.settings.login_max_failures +
+                         [429] * (attempts - self.settings.login_max_failures))
+        self.assertEqual(self.wrong("grace", PASSWORD).status_code, 429)
+
+    def test_username_bucket_cannot_collide_with_the_client_bucket(self):
+        self.user("testclient")
+        for _ in range(self.settings.login_max_failures):
+            self.assertEqual(self.wrong("testclient").status_code, 401)
+        self.assertEqual(self.wrong("testclient", PASSWORD).status_code, 429)
+        self.login("admin", ADMIN_PASSWORD)
+        with self.app.state.sessions() as db:
+            rows = {(row.kind, row.key): row.failures for row in db.scalars(select(LoginFailure))}
+        self.assertEqual(rows, {("user", "testclient"): 5, ("client", "testclient"): 5})
+
+    def test_admin_update_clears_the_lockout(self):
+        user_id, _ = self.user("heidi")
+        for _ in range(self.settings.login_max_failures):
+            self.wrong("heidi")
+        self.assertEqual(self.wrong("heidi", PASSWORD).status_code, 429)
+        self.ok("PATCH", f"/users/{user_id}", json={})
+        self.login("heidi", PASSWORD)
+
+    def test_busy_hashing_answers_503_and_releases_the_reservation(self):
+        self.app.state.hash_slots = threading.BoundedSemaphore(1)
+        self.app.state.hash_slots.acquire()
+        with mock.patch.object(api_auth, "HASH_WAIT_SECONDS", 0.05):
+            busy = self.wrong("admin", ADMIN_PASSWORD)
+            created = self.call("POST", "/users", json={"username": "ivan", "password": PASSWORD})
+        self.assertEqual((busy.status_code, busy.headers["retry-after"]), (503, "0.05"))
+        self.assertEqual(created.status_code, 503)
+        with self.app.state.sessions() as db:
+            self.assertEqual({row.failures for row in db.scalars(select(LoginFailure))}, {0})
+        self.app.state.hash_slots.release()
+        self.login("admin", ADMIN_PASSWORD)
+
+
+class ClientBucketTests(ServerCase):
+    settings_overrides = {"login_max_failures_per_client": 3}
+
+    def test_one_client_is_throttled_across_usernames(self):
+        for name in ("u1", "u2", "u3"):
+            response = self.client.post("/api/v1/auth/login", json={"username": name, "password": "nope-nope-1"})
+            self.assertEqual(response.status_code, 401)
+        locked = self.client.post("/api/v1/auth/login", json={"username": "admin", "password": ADMIN_PASSWORD})
+        self.assertEqual(locked.status_code, 429)
+        self.assertGreater(int(locked.headers["retry-after"]), 0)
+
+    def test_zero_disables_the_client_bucket(self):
+        self.settings.login_max_failures_per_client = 0
+        for name in ("u1", "u2", "u3", "u4"):
+            self.client.post("/api/v1/auth/login", json={"username": name, "password": "nope-nope-1"})
+        self.login("admin", ADMIN_PASSWORD)
+
+
+class GitHostPolicyTests(ServerCase):
+    """F9: git sources are default-deny."""
+
+    def setUp(self):
+        super().setUp()
+        self.project()
+
+    def git(self, url):
+        return self.call("POST", "/projects/demo/jobs", json={"source": {"type": "git", "url": url}})
+
+    def test_git_sources_are_rejected_without_an_allow_list(self):
+        response = self.git("https://example.com/r.git")
+        self.assertEqual(response.status_code, 422)
+        self.assertIn("CRAB_GIT_HOSTS", response.json()["detail"])
+
+    def test_allow_list_matches_host_and_port_exactly(self):
+        self.settings.git_hosts = parse_git_hosts("Git.Example.com, mirror.example:8443, 127.0.0.1, "
+                                                  "169.254.169.254, [::1], 224.0.0.1, 0.0.0.0")
+        self.assertEqual(self.git("https://GIT.example.com/r.git").status_code, 201)
+        self.assertEqual(self.git("https://git.example.com:443/r.git").status_code, 201)
+        self.assertEqual(self.git("https://mirror.example:8443/r.git").status_code, 201)
+        for url in ("https://git.example.com:8443/r.git", "https://mirror.example/r.git",
+                    "https://evil.git.example.com/r.git", "https://127.0.0.1/r.git", "http://169.254.169.254/r",
+                    "https://[::1]/r.git", "https://[::ffff:127.0.0.1]/r.git", "https://224.0.0.1/r",
+                    "https://0.0.0.0/r"):
+            with self.subTest(url=url):
+                self.assertEqual(self.git(url).status_code, 422)
+
+    def test_invalid_allow_list_entries_are_refused(self):
+        for value in ("https://git.example.com", "host:0", "host:99999", "a b"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                parse_git_hosts(value)
+        self.assertEqual(Settings.from_env(data_dir=self.base, environ={"CRAB_GIT_HOSTS": "git.example.com:22"})
+                         .git_hosts, (("git.example.com", 22),))
+
+
+class PathSourceTests(ServerCase):
+    """F10 and the server part of F1."""
+
+    def setUp(self):
+        super().setUp()
+        (self.repos / "other").mkdir()
+        self.project()
+        self.maintainer_id, self.maintainer = self.user("lead")
+        self.member("demo", self.maintainer_id, "maintainer")
+
+    def path_job(self, path, token=None):
+        return self.call("POST", "/projects/demo/jobs", token, json={"source": {"type": "path", "path": str(path)}})
+
+    def test_scan_path_is_admin_only(self):
+        demo = str(self.repos / "demo")
+        self.assertEqual(self.ok("PATCH", "/projects/demo", json={"scan_path": demo})["scan_path"],
+                         os.path.normpath(demo))
+        self.assertEqual(self.ok("GET", "/projects/demo", self.maintainer)["scan_path"], os.path.normpath(demo))
+        self.assertEqual(self.call("PATCH", "/projects/demo", self.maintainer,
+                                   json={"scan_path": str(self.repos)}).status_code, 403)
+        self.ok("PATCH", "/projects/demo", self.maintainer, json={"name": "Renamed"})
+        self.assertEqual(self.call("PATCH", "/projects/demo", json={"scan_path": str(self.base)}).status_code, 422)
+        self.assertEqual(self.call("PATCH", "/projects/demo", json={"scan_path": "relative"}).status_code, 422)
+        created = self.ok("POST", "/projects", status=201,
+                          json={"key": "scoped", "name": "Scoped", "scan_path": str(self.repos / "other")})
+        self.assertEqual(created["scan_path"], os.path.normpath(str(self.repos / "other")))
+        self.assertIsNone(self.ok("PATCH", "/projects/demo", json={"scan_path": None})["scan_path"])
+
+    def test_maintainer_path_jobs_stay_inside_the_scan_path(self):
+        response = self.path_job(self.repos / "demo", self.maintainer)
+        self.assertEqual(response.status_code, 422)
+        self.assertIn("scan_path", response.json()["detail"])
+        self.ok("PATCH", "/projects/demo", json={"scan_path": str(self.repos / "demo")})
+        self.assertEqual(self.path_job(self.repos / "demo", self.maintainer).status_code, 201)
+        self.assertEqual(self.path_job(self.repos / "other", self.maintainer).status_code, 422)
+        self.assertEqual(self.path_job(self.repos / "demo" / ".." / "other", self.maintainer).status_code, 422)
+        self.assertEqual(self.path_job(self.repos / "other").status_code, 201)
+
+    def test_maintainer_schedules_are_confined_at_creation_and_at_run_time(self):
+        source = {"type": "path", "path": str(self.repos / "demo")}
+        self.assertEqual(self.call("POST", "/projects/demo/schedules", self.maintainer,
+                                   json={"cron": "0 3 * * *", "source": source}).status_code, 422)
+        self.ok("PATCH", "/projects/demo", json={"scan_path": str(self.repos / "demo")})
+        mine = self.ok("POST", "/projects/demo/schedules", self.maintainer, status=201,
+                       json={"cron": "0 3 * * *", "source": source})
+        admins = self.ok("POST", "/projects/demo/schedules", status=201,
+                         json={"cron": "0 3 * * *", "source": {"type": "path", "path": str(self.repos / "other")}})
+        self.assertEqual(self.call("PATCH", f"/schedules/{mine['id']}", self.maintainer, json={
+            "source": {"type": "path", "path": str(self.repos / "other")}}).status_code, 422)
+        self.ok("PATCH", "/projects/demo", json={"scan_path": str(self.repos / "other")})
+        with self.app.state.sessions() as db:
+            db.execute(update(Schedule).values(next_run_at=utcnow() - timedelta(minutes=1)))
+            db.commit()
+            service.enqueue_due(db, self.settings)
+            jobs = {job.schedule_id: job for job in db.scalars(select(Job))}
+        self.assertEqual(jobs[mine["id"]].status, "failed")
+        self.assertIn("scan_path", jobs[mine["id"]].error)
+        self.assertEqual(jobs[admins["id"]].status, "queued")
+
+    def test_unc_and_device_paths_are_rejected_without_resolving_them(self):
+        with realpath_guard():
+            for path in UNC_PATHS:
+                with self.subTest(path=path):
+                    self.assertEqual(self.path_job(path).status_code, 422)
+                    self.assertEqual(self.call("PATCH", "/projects/demo", json={"scan_path": path}).status_code, 422)
+                    self.assertEqual(self.call("POST", "/projects/demo/schedules", json={
+                        "cron": "0 3 * * *", "source": {"type": "path", "path": path}}).status_code, 422)
+                    with self.assertRaises(service.ApiError):
+                        service.validate_source({"type": "path", "path": path}, self.settings)
+
+    def test_outside_paths_are_rejected_before_resolving(self):
+        outside = str(self.base / "elsewhere")
+        with mock.patch("os.path.realpath", side_effect=AssertionError("realpath called")):
+            self.assertEqual(self.path_job(outside).status_code, 422)
+
+
+class TokenLifecycleTests(ServerCase):
+    """F11: API tokens follow their creator's current rights."""
+
+    def setUp(self):
+        super().setUp()
+        self.project()
+        self.lead_id, self.lead = self.user("lead")
+        self.member("demo", self.lead_id, "maintainer")
+        self.secret = self.token(["read"], "demo", self.lead)
+
+    def reads(self, secret=None):
+        return self.call("GET", "/projects/demo", secret or self.secret).status_code
+
+    def test_downgrade_and_removal_invalidate_project_tokens(self):
+        self.assertEqual(self.reads(), 200)
+        self.member("demo", self.lead_id, "viewer")
+        self.assertEqual(self.reads(), 401)
+        self.member("demo", self.lead_id, "maintainer")
+        self.assertEqual(self.reads(), 200)
+        self.assertEqual(self.call("DELETE", f"/projects/demo/members/{self.lead_id}").status_code, 204)
+        self.assertEqual(self.reads(), 401)
+
+    def test_deactivation_and_deletion_invalidate_tokens(self):
+        self.ok("PATCH", f"/users/{self.lead_id}", json={"active": False})
+        self.assertEqual(self.reads(), 401)
+        self.ok("PATCH", f"/users/{self.lead_id}", json={"active": True})
+        self.assertEqual(self.reads(), 200)
+        self.assertEqual(self.call("DELETE", f"/users/{self.lead_id}").status_code, 204)
+        self.assertEqual(self.reads(), 401)
+        with self.app.state.sessions() as db:
+            self.assertEqual(db.scalars(select(ApiToken)).all(), [])
+
+    def test_global_tokens_need_an_admin_creator(self):
+        admin_id, admin = self.user("second-admin", "admin")
+        worker = self.token(["worker"], token=admin)
+        claim = self.call("POST", "/workers/claim", worker, json={"worker": "w"})
+        self.assertEqual(claim.status_code, 204)
+        self.ok("PATCH", f"/users/{admin_id}", json={"role": "member"})
+        self.assertEqual(self.call("POST", "/workers/claim", worker, json={"worker": "w"}).status_code, 401)
+
+
+class HardeningTests(ServerCase):
+    def test_api_docs_are_disabled_by_default(self):
+        self.assertEqual(self.client.get("/api/docs").status_code, 404)
+        self.assertEqual(self.client.get("/api/openapi.json").status_code, 404)
+        self.assertFalse(Settings.from_env(data_dir=self.base, environ={}).api_docs)
+        self.assertTrue(Settings.from_env(data_dir=self.base, environ={"CRAB_API_DOCS": "1"}).api_docs)
+
+    def test_huge_page_numbers_are_rejected(self):
+        self.assertEqual(self.call("GET", "/projects?page=100000").status_code, 200)
+        for page in ("100001", "9" * 40):
+            with self.subTest(page=page):
+                self.assertEqual(self.call("GET", f"/projects?page={page}").status_code, 422)
+
+    def test_per_project_caps(self):
+        project = self.project()
+        source = {"type": "path", "path": str(self.repos / "demo")}
+        with self.app.state.sessions() as db:
+            for _ in range(service.MAX_QUEUED_JOBS):
+                db.add(service.new_job(project["id"], source, {}, self.settings))
+            for _ in range(service.MAX_SCHEDULES):
+                db.add(Schedule(project_id=project["id"], cron="0 3 * * *", source=source, options={},
+                                enabled=False, admin_source=True))
+            db.commit()
+        job = self.call("POST", "/projects/demo/jobs", json={"source": source})
+        self.assertEqual(job.status_code, 422)
+        self.assertIn("queued jobs", job.json()["detail"])
+        schedule = self.call("POST", "/projects/demo/schedules", json={"cron": "0 3 * * *", "source": source})
+        self.assertEqual(schedule.status_code, 422)
+        self.assertIn("schedules", schedule.json()["detail"])
+        with self.app.state.sessions() as db:
+            db.execute(update(Schedule).where(Schedule.id == 1).values(enabled=True,
+                                                                       next_run_at=utcnow() - timedelta(minutes=1)))
+            db.commit()
+            created = service.enqueue_due(db, self.settings)
+            skipped = db.get(Job, created[0])
+        self.assertEqual(skipped.status, "failed")
+        self.assertIn("queued jobs", skipped.error)
+
+
+class ApiDocsEnabledTests(ServerCase):
+    settings_overrides = {"api_docs": True}
+
+    def test_docs_can_be_enabled(self):
+        self.assertEqual(self.client.get("/api/openapi.json").status_code, 200)
+        self.assertEqual(self.client.get("/api/docs").status_code, 200)
+
+
 class CliTests(unittest.TestCase):
     def run_cli(self, *args, stdin=None, env=None):
         return subprocess.run([sys.executable, "-m", "crab_risk_scan", *args], cwd=ROOT, input=stdin,
@@ -727,6 +1075,41 @@ class CliTests(unittest.TestCase):
                     self.assertEqual(claim.status_code, 204)
             finally:
                 app.state.engine.dispose()
+
+    def test_admin_unlock_clears_the_lockout(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp:
+            env = dict(os.environ, CRAB_ADMIN_PASSWORD=ADMIN_PASSWORD)
+            settings = Settings.from_env(data_dir=temp, environ={"CRAB_ADMIN_PASSWORD": ADMIN_PASSWORD})
+            app = create_app(settings)
+            try:
+                with app.state.sessions() as db:
+                    db.add(LoginFailure(kind="user", key="admin", failures=5, first_failure_at=utcnow(),
+                                        locked_until=utcnow() + timedelta(minutes=15)))
+                    db.add(LoginFailure(kind="client", key="admin", failures=5, first_failure_at=utcnow()))
+                    db.commit()
+                unlocked = self.run_cli("admin", "unlock", "Admin", "--data-dir", temp, env=env)
+                self.assertEqual(unlocked.returncode, 0, unlocked.stderr)
+                self.assertIn("cleared for admin", unlocked.stdout)
+                with app.state.sessions() as db:
+                    self.assertEqual([(row.kind, row.key) for row in db.scalars(select(LoginFailure))],
+                                     [("client", "admin")])
+                again = self.run_cli("admin", "unlock", "admin", "--data-dir", temp, env=env)
+                self.assertIn("no recorded", again.stdout)
+            finally:
+                app.state.engine.dispose()
+
+    def test_serve_passes_forwarded_allow_ips_to_uvicorn(self):
+        from crab_risk_scan.__main__ import build_parser
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp:
+            args = build_parser().parse_args(["serve", "--data-dir", temp, "--no-scheduler",
+                                              "--forwarded-allow-ips", "10.0.0.5,10.0.0.6"])
+            with mock.patch.dict(os.environ, {"CRAB_ADMIN_PASSWORD": ADMIN_PASSWORD}), \
+                    mock.patch("uvicorn.run") as run:
+                self.assertEqual(cli.run_serve(args), 0)
+            run.call_args.args[0].state.engine.dispose()
+            self.assertEqual(run.call_args.kwargs["forwarded_allow_ips"], "10.0.0.5,10.0.0.6")
+            default = build_parser().parse_args(["serve"])
+            self.assertIsNone(default.forwarded_allow_ips)
 
 
 if __name__ == "__main__":

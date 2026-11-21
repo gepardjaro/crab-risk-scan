@@ -10,6 +10,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from crab_risk_scan import worker as worker_module
 from crab_risk_scan.worker import Client, Heartbeat, JobError, Worker
@@ -71,9 +72,113 @@ class WorkerUnitTests(unittest.TestCase):
         with self.assertRaises(JobError):
             self.worker.command(self.root, output, {"fail_on": "severe"})
 
+    def test_path_sources_reject_unc_and_device_paths_without_resolving(self):
+        original = os.path.realpath
+
+        def guarded(path, *args, **kwargs):
+            text = os.fspath(path)
+            if len(text) >= 2 and text[0] in "\\/" and text[1] in "\\/":
+                raise AssertionError(f"realpath called for {text!r}")
+            return original(path, *args, **kwargs)
+        with mock.patch("os.path.realpath", side_effect=guarded):
+            for path in ("\\\\attacker.example\\share", "//attacker.example/share", "\\\\?\\UNC\\host\\share",
+                         "\\\\.\\pipe\\crab", "\\\\?\\" + str(self.root / "demo")):
+                with self.subTest(path=path), self.assertRaisesRegex(JobError, "UNC or device"):
+                    self.worker.resolve_path(path)
+        with mock.patch("os.path.realpath", side_effect=AssertionError("realpath called")):
+            with self.assertRaisesRegex(JobError, "outside"):
+                self.worker.resolve_path(str(Path(self.temp.name) / "elsewhere"))
+
+    def git_worker(self, git_hosts=()):
+        return Worker(Client("http://127.0.0.1:9", "crab_x"), "unit", allow_git=True, git_hosts=git_hosts,
+                      stream=io.StringIO())
+
+    @staticmethod
+    def resolved(*addresses):
+        return [(socket.AF_INET6 if ":" in a else socket.AF_INET, socket.SOCK_STREAM, 6, "", (a, 443))
+                for a in addresses]
+
+    def test_git_runs_with_a_minimal_environment_and_a_pinned_address(self):
+        calls = []
+
+        def run(command, **kwargs):
+            calls.append((command, kwargs))
+            return subprocess.CompletedProcess(command, 0, stdout="a" * 40 + "\n", stderr="")
+        beat = Heartbeat(None, 1, "unit", 30, io.StringIO())
+        directory = Path(self.temp.name) / "checkout"
+        with mock.patch.dict(os.environ, {"GITHUB_TOKEN": "SYNTHETIC_SECRET", "HTTPS_PROXY": "http://proxy:1",
+                                          "GIT_ASKPASS": "/bin/askpass"}), \
+                mock.patch.object(worker_module.shutil, "which", return_value="git"), \
+                mock.patch.object(worker_module.socket, "getaddrinfo", return_value=self.resolved("93.184.216.34")), \
+                mock.patch.object(worker_module.subprocess, "run", side_effect=run):
+            revision = self.git_worker((("example.com", None),)).checkout("https://Example.com/r.git", "main",
+                                                                          directory, beat)
+        self.assertEqual(revision, "a" * 40)
+        self.assertEqual(len(calls), 4)
+        allowed = {"PATH", "HOME", "GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_GLOBAL", "GIT_TERMINAL_PROMPT",
+                   "GIT_LFS_SKIP_SMUDGE", "GIT_ALLOW_PROTOCOL", "SYSTEMROOT", "TEMP", "TMP"}
+        for command, kwargs in calls:
+            env = kwargs["env"]
+            self.assertLessEqual(set(env), allowed)
+            self.assertEqual((env["GIT_CONFIG_NOSYSTEM"], env["GIT_CONFIG_GLOBAL"], env["GIT_ALLOW_PROTOCOL"]),
+                             ("1", os.devnull, "http:https"))
+            self.assertEqual(env["HOME"], str(Path(self.temp.name) / "git-home"))
+            self.assertNotIn("SYNTHETIC_SECRET", json.dumps(env))
+            pairs = {command[i + 1] for i, part in enumerate(command) if part == "-c"}
+            for setting in ("credential.helper=", "http.followRedirects=false", "filter.lfs.smudge=",
+                            "filter.lfs.process=", "filter.lfs.required=false", "submodule.recurse=false",
+                            "protocol.allow=never", "protocol.http.allow=always", "protocol.https.allow=always",
+                            "http.curloptResolve=example.com:443:93.184.216.34"):
+                self.assertIn(setting, pairs)
+
+    def test_git_rejects_internal_addresses_and_unlisted_hosts(self):
+        beat = Heartbeat(None, 1, "unit", 30, io.StringIO())
+        directory = Path(self.temp.name) / "checkout"
+        for addresses in (("127.0.0.1",), ("169.254.169.254",), ("93.184.216.34", "10.0.0.1", "::1"),
+                          ("fe80::1",), ("0.0.0.0",), ("224.0.0.1",), ("240.0.0.1",), ("::ffff:127.0.0.1",)):
+            with self.subTest(addresses=addresses), \
+                    mock.patch.object(worker_module.shutil, "which", return_value="git"), \
+                    mock.patch.object(worker_module.socket, "getaddrinfo", return_value=self.resolved(*addresses)), \
+                    mock.patch.object(worker_module.subprocess, "run", side_effect=AssertionError("git ran")):
+                with self.assertRaisesRegex(JobError, "loopback"):
+                    self.git_worker().checkout("https://example.com/r.git", None, directory, beat)
+        with mock.patch.object(worker_module.shutil, "which", return_value="git"), \
+                mock.patch.object(worker_module.socket, "getaddrinfo", side_effect=AssertionError("resolved")):
+            with self.assertRaisesRegex(JobError, "--git-host"):
+                self.git_worker((("git.example.com", None),)).checkout("https://example.com/r.git", None,
+                                                                       directory, beat)
+            with self.assertRaisesRegex(JobError, "--git-host"):
+                self.git_worker((("example.com", None),)).checkout("https://example.com:8443/r.git", None,
+                                                                   directory, beat)
+
+    def test_git_failures_are_reported_as_categories_without_stderr(self):
+        beat = Heartbeat(None, 1, "unit", 30, io.StringIO())
+        directory = Path(self.temp.name) / "checkout"
+        stderr = "fatal: could not read Username for 'https://example.com': terminal prompts disabled SYNTHETIC_SECRET"
+
+        def run(command, **kwargs):
+            code = 128 if "fetch" in command else 0
+            return subprocess.CompletedProcess(command, code, stdout="", stderr=stderr if code else "")
+        with mock.patch.object(worker_module.shutil, "which", return_value="git"), \
+                mock.patch.object(worker_module.socket, "getaddrinfo", return_value=self.resolved("93.184.216.34")), \
+                mock.patch.object(worker_module.subprocess, "run", side_effect=run):
+            with self.assertRaises(JobError) as caught:
+                self.git_worker().checkout("https://example.com/r.git", None, directory, beat)
+        self.assertEqual(str(caught.exception), "git fetch failed: authentication required or repository not found")
+        self.assertEqual(caught.exception.log, "")
+        cases = {"fatal: unable to access 'https://x/': Could not resolve host: x": "could not connect",
+                 "fatal: couldn't find remote ref refs/heads/nope": "reference not found",
+                 "fatal: unable to access 'https://x/': The requested URL returned error: 403":
+                     "authentication required or repository not found",
+                 "error: RPC failed; curl 28 Operation timed out": "timed out",
+                 "something unexpected": "git failed with status 7"}
+        for text, category in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(worker_module.git_failure(text, 7), category)
+
     def test_cli_requires_token_and_http_server(self):
         args = argparse.Namespace(server="http://127.0.0.1:9", token=None, name=None, once=True, poll_interval=1,
-                                  allow_git=False, scan_root=[], timeout=10)
+                                  allow_git=False, scan_root=[], git_host=[], timeout=10)
         env = dict(os.environ)
         env.pop("CRAB_WORKER_TOKEN", None)
         result = subprocess.run([sys.executable, "-m", "crab_risk_scan", "worker", "--server", "http://127.0.0.1:9",

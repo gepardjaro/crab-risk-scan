@@ -1,8 +1,8 @@
-"""Background maintenance loop: lease expiry and scheduled scan enqueueing."""
+"""Background maintenance loop: lease expiry, sign-in failure pruning and scheduled scan enqueueing."""
 import logging
 import threading
 
-from .service import enqueue_due, requeue_expired
+from .service import enqueue_due, prune_login_failures, requeue_expired
 
 log = logging.getLogger("crab_risk_scan.server")
 
@@ -19,9 +19,12 @@ class Scheduler:
     def tick(self):
         with self.sessions() as db:
             requeued, failed = requeue_expired(db)
+            pruned = prune_login_failures(db, self.settings)
             db.commit()
             if requeued or failed:
                 log.info("lease expiry: %d jobs requeued, %d failed", requeued, failed)
+            if pruned:
+                log.info("pruned %d expired sign-in failure records", pruned)
         with self.sessions() as db:
             created = enqueue_due(db, self.settings)
             if created:

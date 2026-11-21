@@ -3,6 +3,7 @@
 Functions raise ApiError for client mistakes; the application maps it to `{"detail": ...}`.
 """
 import copy
+import ipaddress
 import json
 import os
 import re
@@ -12,10 +13,11 @@ from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from sqlalchemy import and_, func, not_, or_, select, update
+from sqlalchemy import and_, delete, func, not_, or_, select, update
 
 from .cron import CronExpression
-from .db import Finding, Job, Project, ProjectException, Scan, Schedule, Worker, utcnow
+from .db import Finding, Job, LoginFailure, Project, ProjectException, Scan, Schedule, Worker, utcnow
+from .safety import blocked_address, host_allowed, unc_or_device, within
 
 SEVERITIES = ("critical", "high", "medium", "low", "info", "unknown")
 CATEGORIES = ("sast", "secrets", "iac", "sca", "container")
@@ -32,6 +34,8 @@ WORKER_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 LOG_LIMIT = 64 * 1024
 ERROR_LIMIT = 2000
 CHUNK = 500
+MAX_SCHEDULES = 50
+MAX_QUEUED_JOBS = 100
 SCHEMA_PATH = Path(__file__).resolve().parent.parent / "schemas" / "report-v3.schema.json"
 
 
@@ -353,23 +357,75 @@ def export_exceptions(rows):
 
 # Jobs -----------------------------------------------------------------------------------------
 
-def validate_source(source, scan_roots):
+def checked_path(path, label):
+    if not isinstance(path, str) or not path or len(path) > 4096 or "\x00" in path:
+        raise ApiError(422, f"{label} must be a non-empty string")
+    if unc_or_device(path):
+        raise ApiError(422, f"{label} must not be a UNC or device path")
+    if not os.path.isabs(path):
+        raise ApiError(422, f"{label} must be absolute")
+    return path
+
+
+def inside(path, roots):
+    """Containment in `roots`: lexical first, then the resolved path. realpath runs only on
+    paths that are already lexically inside a root, so it never reaches the network."""
+    if not any(within(path, root) for root in roots):
+        return False
+    real = os.path.realpath(path)
+    return any(within(real, os.path.realpath(root)) for root in roots)
+
+
+def validate_scan_path(value, scan_roots):
+    """Admin-set project scan path: absolute, inside the server scan roots. Empty clears it."""
+    if value is None or value == "":
+        return None
+    path = checked_path(value, "scan_path")
+    if not scan_roots:
+        raise ApiError(422, "scan_path needs CRAB_SCAN_ROOTS on the server")
+    if not inside(path, scan_roots):
+        raise ApiError(422, "scan_path is outside the allowed scan roots")
+    return os.path.normpath(path)
+
+
+def check_git_host(parts, git_hosts):
+    """Default-deny: the URL host must match a CRAB_GIT_HOSTS entry exactly. An entry without a
+    port matches only the scheme's default port. Literal blocked addresses never pass."""
+    if not git_hosts:
+        raise ApiError(422, "git sources are disabled; list allowed hosts in CRAB_GIT_HOSTS on the server")
+    host = parts.hostname.rstrip(".")
+    try:
+        port = parts.port
+    except ValueError:
+        raise ApiError(422, "source.url has an invalid port") from None
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        address = None
+    if address is not None and blocked_address(address):
+        raise ApiError(422, "source.url must not point to a loopback, link-local, multicast or reserved address")
+    if not host_allowed(host, port, 443 if parts.scheme == "https" else 80, git_hosts):
+        raise ApiError(422, "source.url host is not listed in CRAB_GIT_HOSTS")
+
+
+def validate_source(source, settings, *, scan_path=None, confined=False):
+    """Validate a job or schedule source. `confined` (non-admin) path sources must resolve inside
+    the project's `scan_path`; without one they are rejected."""
     if not isinstance(source, dict):
         raise ApiError(422, "source must be an object")
     kind = source.get("type")
     if kind == "path":
         if set(source) - {"type", "path"}:
             raise ApiError(422, "path sources accept only type and path")
-        path = source.get("path")
-        if not isinstance(path, str) or not path or len(path) > 4096 or "\x00" in path:
-            raise ApiError(422, "source.path must be a non-empty string")
-        if not os.path.isabs(path):
-            raise ApiError(422, "source.path must be absolute")
-        if not scan_roots:
+        path = checked_path(source.get("path"), "source.path")
+        if not settings.scan_roots:
             raise ApiError(422, "path sources are disabled; set CRAB_SCAN_ROOTS on the server")
-        real = Path(os.path.realpath(path))
-        if not any(real == root or real.is_relative_to(root) for root in scan_roots):
+        if confined and not scan_path:
+            raise ApiError(422, "path sources need a project scan_path set by an admin")
+        if not inside(path, settings.scan_roots):
             raise ApiError(422, "source.path is outside the allowed scan roots")
+        if confined and not inside(path, (scan_path,)):
+            raise ApiError(422, "source.path is outside the project's scan_path")
         return {"type": "path", "path": path}
     if kind == "git":
         if set(source) - {"type", "url", "ref"}:
@@ -380,6 +436,7 @@ def validate_source(source, scan_roots):
         parts = urlsplit(url)
         if parts.username or parts.password:
             raise ApiError(422, "source.url must not contain credentials")
+        check_git_host(parts, settings.git_hosts)
         ref = source.get("ref") or None
         if ref is not None and (not isinstance(ref, str) or not GIT_REF.fullmatch(ref) or ".." in ref):
             raise ApiError(422, "source.ref must be a branch, tag or commit name")
@@ -388,6 +445,19 @@ def validate_source(source, scan_roots):
             result["ref"] = ref
         return result
     raise ApiError(422, "source.type must be path or git")
+
+
+def check_queue_capacity(db, project_id):
+    queued = db.scalar(select(func.count()).select_from(Job).where(Job.project_id == project_id,
+                                                                   Job.status == "queued"))
+    if queued >= MAX_QUEUED_JOBS:
+        raise ApiError(422, f"the project already has {MAX_QUEUED_JOBS} queued jobs")
+
+
+def check_schedule_capacity(db, project_id):
+    count = db.scalar(select(func.count()).select_from(Schedule).where(Schedule.project_id == project_id))
+    if count >= MAX_SCHEDULES:
+        raise ApiError(422, f"the project already has {MAX_SCHEDULES} schedules")
 
 
 def validate_options(options):
@@ -551,11 +621,11 @@ def enqueue_due(db, settings, now=None):
     now = now or utcnow()
     created = []
     due = db.execute(select(Schedule.id, Schedule.project_id, Schedule.cron, Schedule.next_run_at, Schedule.source,
-                            Schedule.options)
+                            Schedule.options, Schedule.admin_source)
                      .where(Schedule.enabled.is_(True), Schedule.next_run_at.is_not(None),
                             Schedule.next_run_at <= now).order_by(Schedule.next_run_at)).all()
     db.commit()
-    for schedule_id, project_id, cron, previous, source, options in due:
+    for schedule_id, project_id, cron, previous, source, options, admin_source in due:
         try:
             following = CronExpression(cron).next_after(now)
         except ValueError:
@@ -568,10 +638,16 @@ def enqueue_due(db, settings, now=None):
             continue
         job = new_job(project_id, source, options, settings, schedule_id=schedule_id)
         try:
-            job.source = validate_source(source, settings.scan_roots)
+            scan_path = db.scalar(select(Project.scan_path).where(Project.id == project_id))
+            job.source = validate_source(source, settings, scan_path=scan_path, confined=not admin_source)
             job.options = validate_options(options)
         except ApiError as exc:
             job.status, job.finished_at, job.error = "failed", now, f"schedule source rejected: {exc.detail}"
+        else:
+            try:
+                check_queue_capacity(db, project_id)
+            except ApiError as exc:
+                job.status, job.finished_at, job.error = "failed", now, f"schedule run skipped: {exc.detail}"
         db.add(job)
         db.flush()
         db.execute(update(Schedule).where(Schedule.id == schedule_id).values(last_job_id=job.id)
@@ -579,6 +655,16 @@ def enqueue_due(db, settings, now=None):
         db.commit()
         created.append(job.id)
     return created
+
+
+def prune_login_failures(db, settings, now=None):
+    """Delete sign-in failure rows whose window has passed and that hold no active lock."""
+    now = now or utcnow()
+    horizon = now - timedelta(seconds=settings.login_lockout_seconds)
+    return db.execute(delete(LoginFailure).where(
+        LoginFailure.first_failure_at < horizon,
+        or_(LoginFailure.locked_until.is_(None), LoginFailure.locked_until <= now),
+    ).execution_options(synchronize_session=False)).rowcount
 
 
 # Dashboards -----------------------------------------------------------------------------------

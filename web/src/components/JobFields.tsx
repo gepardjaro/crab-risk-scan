@@ -47,7 +47,7 @@ export function JobFields({ values, onChange }: { values: JobValues; onChange: (
       </fieldset>
       {values.type === "path" ? (
         <label className="field wide">
-          <span>Path inside an allowed scan root</span>
+          <span>Path inside the project's scan path (administrators: any allowed scan root)</span>
           <input required maxLength={4096} value={values.path} onChange={(e) => set("path", e.target.value)} />
         </label>
       ) : (

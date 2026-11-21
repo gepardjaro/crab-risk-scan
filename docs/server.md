@@ -41,7 +41,7 @@ echo "CRAB_WORKER_TOKEN=<token>" >> .env
 docker compose up -d worker
 ```
 
-The worker network is internal, so workers have no internet access. Prepare the vulnerability databases into the cache volume from a networked container, for example `docker compose run --rm --no-deps --network bridge --entrypoint crab-risk-scan worker db update`, or build the scanner image with `PREFETCH_DB=true`. Git jobs need network access to the git host: attach the worker to a network that reaches it and add `--allow-git` to its command. `CRAB_WORKERS` sets the number of worker replicas.
+The worker network is internal, so workers have no internet access. Prepare the vulnerability databases into the cache volume from a networked container, for example `docker compose run --rm --no-deps --network bridge --entrypoint crab-risk-scan worker db update`, or build the scanner image with `PREFETCH_DB=true`. Git jobs need network access to the git host: attach the worker to a network that reaches it, add `--allow-git` to its command and list the host in `CRAB_GIT_HOSTS`. `CRAB_WORKERS` sets the number of worker replicas.
 
 For PostgreSQL, set `POSTGRES_PASSWORD` and `CRAB_DATABASE_URL=postgresql+psycopg://crab:<password>@db:5432/crab` in `.env`, then run `docker compose --profile postgres up -d --build`.
 
@@ -55,15 +55,26 @@ The Docker files were written for this release but are not exercised by the test
 | Database URL | `--database` | `CRAB_DATABASE_URL` | `sqlite:///<data dir>/crab.db` |
 | Data directory | `--data-dir` | `CRAB_DATA_DIR` | Platform user data directory, `crab-risk-scan` |
 | Allowed scan roots for path jobs | | `CRAB_SCAN_ROOTS` (`os.pathsep`-separated absolute paths) | none: path jobs are rejected |
+| Allowed git hosts | | `CRAB_GIT_HOSTS` (comma-separated `host` or `host:port`) | none: git sources are rejected |
 | First administrator | | `CRAB_ADMIN_USERNAME`, `CRAB_ADMIN_PASSWORD` | `admin`, generated password |
 | Session lifetime in hours | | `CRAB_SESSION_HOURS` | 12 |
 | Job lease in seconds | | `CRAB_LEASE_SECONDS` | 300 |
 | Attempts per job before it fails | | `CRAB_JOB_MAX_ATTEMPTS` | 3 |
 | Schedule loop | `--no-scheduler` | `CRAB_SCHEDULER=0` | enabled |
 | Schedule loop interval in seconds | | `CRAB_SCHEDULER_INTERVAL` | 30 |
-| Trusted reverse proxies | | `FORWARDED_ALLOW_IPS` (read by uvicorn) | `127.0.0.1` |
+| Trusted reverse proxies | `--forwarded-allow-ips` | `FORWARDED_ALLOW_IPS` (read by uvicorn) | `127.0.0.1` |
+| Failed sign-ins per client address per lockout window | | `CRAB_LOGIN_MAX_FAILURES_PER_CLIENT` (0 disables) | 100 |
+| Concurrent password hash computations | | `CRAB_PASSWORD_HASH_CONCURRENCY` | 4 |
+| OpenAPI document and Swagger UI | | `CRAB_API_DOCS=1` | disabled |
 
 Uploads accept up to 32 MiB per report and per SBOM. Larger documents receive 413.
+
+`CRAB_GIT_HOSTS` entries match the URL host exactly and case-insensitively. An entry without a port matches only the scheme's default port (443 or 80). Literal loopback, link-local, unspecified, multicast and reserved addresses are rejected even when listed. Existing schedules are checked again at every run.
+
+| Per-project limit | Value | Beyond the limit |
+|---|---|---|
+| Schedules | 50 | 422 |
+| Queued jobs | 100 | 422; a due schedule run is recorded as a failed job |
 
 The server creates missing tables at startup and records the schema version in `crab_schema`. It refuses to start on a database written by a newer release.
 
@@ -73,7 +84,7 @@ The server creates missing tables at startup and records the schema version in `
 |---|---|---|
 | admin | global | Everything, including users, projects, service tokens, the job queue and workers |
 | member | global | Sign in and see projects where they hold a membership |
-| maintainer | project | Upload scans, triage exceptions, run jobs, manage schedules, project settings, members and project tokens |
+| maintainer | project | Upload scans, triage exceptions, run jobs inside the project's scan path, manage schedules, project settings except the scan path, members and project tokens |
 | viewer | project | Read scans, findings, reports, exceptions, jobs and dashboards |
 
 Projects that a principal cannot see answer 404. Visible projects with an insufficient role answer 403.
@@ -84,6 +95,7 @@ Projects that a principal cannot see answer 404. Visible projects with an insuff
 |---|---|
 | `admin create-user NAME [--role admin\|member] [--password-stdin]` | Create a user. Prompts twice on a terminal. |
 | `admin set-password NAME [--password-stdin]` | Replace the password, revoke sessions and clear the sign-in lockout |
+| `admin unlock NAME` | Clear the account's failed sign-in counter and lockout |
 | `admin create-token NAME --scope SCOPE [--scope ...] [--project KEY]` | Print a new API token once |
 | `admin list-tokens [--project KEY]` | List tokens with their 12-character prefix, never the secret |
 
@@ -93,15 +105,20 @@ Projects that a principal cannot see answer 404. Visible projects with an insuff
 |---|---|---|
 | `scan:upload` | `POST /projects/{key}/scans`. CI runners use it. | Admins; maintainers for their project |
 | `read` | Read endpoints of the bound project, or of all projects for unbound tokens | Admins; maintainers for their project |
-| `worker` | Claim, heartbeat, complete and fail jobs | Admins only, never bound to a project |
+| `worker` | Claim, heartbeat, complete and fail jobs of every project | Admins only, never bound to a project |
 
 Tokens start with `crab_`. The server stores only their SHA-256 digest.
+
+Any `worker` token can claim any project's job and receives its source. Treat worker tokens as instance-wide credentials.
+
+A token created through the API stays valid only while its creator is active and could still create it: a project-bound token created by a non-admin needs the creator to remain a maintainer of that project, and a global token needs the creator to remain an admin. Deleting the creator deletes the token. Tokens created with `admin create-token` have no creator and are unaffected.
 
 ## Workers
 
 ```sh
 crab-risk-scan worker --server https://crab.example.com --token "$CRAB_WORKER_TOKEN" \
-    --scan-root /srv/repos [--allow-git] [--name NAME] [--poll-interval 10] [--timeout 3600] [--once]
+    --scan-root /srv/repos [--allow-git] [--git-host HOST[:PORT] ...] [--name NAME] [--poll-interval 10] \
+    [--timeout 3600] [--once]
 ```
 
 The worker uses only the standard library. Each job runs this command in a private temporary directory, so the target never lands on the Python import path:
@@ -119,8 +136,8 @@ Exit 0, 1 or 2 with a report completes the job and stores a scan. Other outcomes
 | Lease | `CRAB_LEASE_SECONDS`. The worker sends heartbeats every third of the lease. |
 | Lost worker | Expired leases return the job to the queue until `CRAB_JOB_MAX_ATTEMPTS`, then the job fails |
 | Cancellation | Cancelling a running job makes the next heartbeat stop the scan subprocess |
-| Path sources | Must resolve inside `CRAB_SCAN_ROOTS` on the server and inside `--scan-root` (or `CRAB_SCAN_ROOTS`) on the worker |
-| Git sources | http or https URLs without credentials. Only workers started with `--allow-git` receive them. Checkouts disable symlinks, hooks and the file protocol. |
+| Path sources | Must stay inside `CRAB_SCAN_ROOTS` on the server and inside `--scan-root` (or `CRAB_SCAN_ROOTS`) on the worker. Jobs and schedules created by non-admins must also stay inside the project's `scan_path`, which only admins set; without one they are rejected. UNC and device paths are rejected, and containment is checked lexically before the path is resolved. |
+| Git sources | http or https URLs without credentials whose host is listed in `CRAB_GIT_HOSTS`. Only workers started with `--allow-git` receive them. `--git-host` (default `CRAB_GIT_HOSTS`) restricts hosts on the worker when set. The worker resolves the host, refuses loopback, link-local, unspecified, multicast and reserved addresses, and pins git to the checked address. Git runs with a minimal environment, no credential helpers, redirects, LFS filters, submodules, hooks or symlinks, and only the http and https protocols. Job logs contain a failure category, never git's output. |
 | Stop | SIGTERM finishes the current job, then exits |
 
 ## Schedules
@@ -152,7 +169,9 @@ In Compose, the SQLite file is `/var/lib/crab/crab.db` in the `crab-data` volume
 |---|---|
 | Passwords | scrypt (N=2^15, r=8, p=1) with a random salt, compared in constant time; 10 to 1024 characters |
 | Sessions | Random bearer tokens, stored as SHA-256 digests, expiring after `CRAB_SESSION_HOURS`. Password changes and deactivation revoke them. |
-| Sign-in throttling | Five failures within 15 minutes lock the account name for 15 minutes (429 with Retry-After) |
+| Sign-in throttling | Each attempt is counted before the password check, atomically, so concurrent requests cannot exceed the limit. Five failures within 15 minutes lock the account name for 15 minutes; `CRAB_LOGIN_MAX_FAILURES_PER_CLIENT` failures lock the client address (429 with Retry-After). Behind a reverse proxy, pass `--forwarded-allow-ips` with the proxy address, otherwise every client shares the proxy's bucket. The schedule loop prunes expired records. |
+| Password hashing | At most `CRAB_PASSWORD_HASH_CONCURRENCY` scrypt computations run at once. A request that waits more than 5 seconds receives 503 with Retry-After. |
+| Request bodies | Authorization happens before an upload body is read. At most two large bodies are buffered and parsed at once, off the event loop. `NaN` and `Infinity` are rejected. |
 | Uploads | Schema-3 validation with jsonschema. Errors name the JSON path and failing keyword, never the value. |
 | Response headers | `nosniff`, `X-Frame-Options: DENY`, `no-referrer`, a same-origin Content Security Policy, and `no-store` on API responses |
 | HTML reports | Downloaded with a sandbox Content Security Policy |

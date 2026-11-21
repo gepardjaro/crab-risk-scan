@@ -15,6 +15,7 @@ function CreateProject() {
   const [name, setName] = useState("");
   const [repository, setRepository] = useState("");
   const [branch, setBranch] = useState("");
+  const [scanPath, setScanPath] = useState("");
   const { busy, error, run } = useAction();
 
   async function submit(event: FormEvent) {
@@ -25,6 +26,7 @@ function CreateProject() {
         name: name.trim(),
         repository_url: repository.trim() || null,
         default_branch: branch.trim() || null,
+        scan_path: scanPath.trim() || null,
       }),
     );
     if (created) navigate(`/projects/${encodeURIComponent(created.key)}`);
@@ -49,6 +51,10 @@ function CreateProject() {
       <label className="field">
         <span>Default branch</span>
         <input value={branch} onChange={(e) => setBranch(e.target.value)} />
+      </label>
+      <label className="field">
+        <span>Scan path</span>
+        <input maxLength={4096} placeholder="Absolute path inside a server scan root" value={scanPath} onChange={(e) => setScanPath(e.target.value)} />
       </label>
       <div className="form-actions">
         <button type="submit" className="btn btn-primary" disabled={busy}>

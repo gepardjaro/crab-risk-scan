@@ -1,9 +1,11 @@
 """Health, authentication, users and API tokens."""
+from contextlib import contextmanager
 from datetime import timedelta
 
 from fastapi import APIRouter, Depends, Query, Request, Response
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import delete, func, select
+from sqlalchemy.exc import IntegrityError
 
 from .. import __version__
 from .auth import (SCOPES, Paging, Principal, get_db, get_principal, load_project, project_role, require_admin,
@@ -12,6 +14,8 @@ from .db import ApiToken, LoginFailure, Membership, Project, SessionToken, User,
 from .security import (TOKEN_PREFIX, burn_password_check, digest, hash_password, new_secret, normalize_username,
                        validate_password, verify_password)
 from .service import ApiError, iso
+
+HASH_WAIT_SECONDS = 5
 
 router = APIRouter()
 
@@ -78,37 +82,109 @@ def health():
     return {"status": "ok", "version": __version__}
 
 
+@contextmanager
+def hashing_slot(request):
+    """Bound concurrent scrypt computations. A request that cannot get a slot within a few
+    seconds is answered 503 instead of queueing without limit."""
+    slots = request.app.state.hash_slots
+    if not slots.acquire(timeout=HASH_WAIT_SECONDS):
+        raise ApiError(503, "the server is busy; try again shortly", {"Retry-After": str(HASH_WAIT_SECONDS)})
+    try:
+        yield
+    finally:
+        slots.release()
+
+
+def login_buckets(settings, name, client):
+    """(kind, key, limit) per throttling bucket: the account, and the client address unless disabled."""
+    buckets = [("user", name, settings.login_max_failures)]
+    if settings.login_max_failures_per_client and client:
+        buckets.append(("client", client[:64], settings.login_max_failures_per_client))
+    return buckets
+
+
+def locked_row(db, kind, key):
+    """Failure row under a row lock (SELECT ... FOR UPDATE; SQLite transactions are immediate)."""
+    return db.get(LoginFailure, (kind, key), with_for_update=True, populate_existing=True)
+
+
+def reserve_attempt(db, buckets, now, window):
+    """Count the attempt in every bucket before the password check, in one transaction, so
+    concurrent requests can never run more checks than the limit allows. Raises 429 when a
+    bucket is locked or already at its limit."""
+    for _ in range(3):
+        refused = None
+        try:
+            for kind, key, limit in buckets:
+                row = locked_row(db, kind, key)
+                if row is None:
+                    row = LoginFailure(kind=kind, key=key, failures=0, first_failure_at=now)
+                    db.add(row)
+                    db.flush()
+                if row.locked_until is not None and row.locked_until > now:
+                    refused = row.locked_until
+                elif now - row.first_failure_at > window:
+                    row.failures, row.first_failure_at, row.locked_until = 0, now, None
+                if refused is None and row.failures >= limit:
+                    refused = row.first_failure_at + window
+                if refused is not None:
+                    break
+                row.failures += 1
+        except IntegrityError:  # a concurrent request created the same row first
+            db.rollback()
+            continue
+        if refused is not None:
+            db.rollback()
+            retry = max(1, int((refused - now).total_seconds()) + 1)
+            raise ApiError(429, "too many failed sign-in attempts; try again later", {"Retry-After": str(retry)})
+        db.commit()
+        return
+    raise ApiError(503, "the server is busy; try again shortly", {"Retry-After": "1"})
+
+
+def settle_attempt(db, buckets, now, window, outcome):
+    """Resolve a reserved attempt. "failure" keeps the count and locks buckets at their limit;
+    "success" clears the account bucket and returns the client reservation; "release" returns
+    both reservations (the check never ran). The caller commits."""
+    for kind, key, limit in buckets:
+        row = locked_row(db, kind, key)
+        if row is None:
+            continue
+        if outcome == "failure":
+            if row.failures >= limit:
+                row.locked_until = now + window
+        elif outcome == "success" and kind == "user":
+            db.delete(row)
+        else:
+            row.failures = max(0, row.failures - 1)
+
+
 @router.post("/auth/login")
 def login(body: LoginBody, request: Request, db=Depends(get_db)):
     settings = request.app.state.settings
     name = body.username.strip().lower()[:64]
-    now = utcnow()
-    failure = db.get(LoginFailure, name)
-    if failure is not None and failure.locked_until is not None and failure.locked_until > now:
-        retry = int((failure.locked_until - now).total_seconds()) + 1
-        db.commit()
-        raise ApiError(429, "too many failed sign-in attempts; try again later", {"Retry-After": str(retry)})
+    window = timedelta(seconds=settings.login_lockout_seconds)
+    buckets = login_buckets(settings, name, request.client.host if request.client else "")
+    reserve_attempt(db, buckets, utcnow(), window)
     user = db.scalar(select(User).where(User.username == name))
     db.commit()
-    if user is None:
-        burn_password_check(body.password)
-        valid = False
-    else:
-        valid = verify_password(body.password, user.password_hash) and user.active
+    try:
+        with hashing_slot(request):
+            if user is None:
+                burn_password_check(body.password)
+                valid = False
+            else:
+                valid = verify_password(body.password, user.password_hash) and user.active
+    except ApiError:
+        settle_attempt(db, buckets, utcnow(), window, "release")
+        db.commit()
+        raise
+    now = utcnow()
     if not valid:
-        window = timedelta(seconds=settings.login_lockout_seconds)
-        failure = db.get(LoginFailure, name)
-        if failure is None:
-            failure = LoginFailure(username=name, failures=0, first_failure_at=now)
-            db.add(failure)
-        if now - failure.first_failure_at > window:
-            failure.failures, failure.first_failure_at, failure.locked_until = 0, now, None
-        failure.failures += 1
-        if failure.failures >= settings.login_max_failures:
-            failure.locked_until = now + window
+        settle_attempt(db, buckets, now, window, "failure")
         db.commit()
         raise ApiError(401, "invalid username or password")
-    db.execute(delete(LoginFailure).where(LoginFailure.username == name))
+    settle_attempt(db, buckets, now, window, "success")
     db.execute(delete(SessionToken).where(SessionToken.expires_at <= now))
     secret = new_secret()
     expires = now + timedelta(hours=settings.session_hours)
@@ -145,26 +221,40 @@ def list_users(paging: Paging = Depends(), db=Depends(get_db), principal: Princi
 
 
 @router.post("/users", status_code=201)
-def create_user(body: UserCreate, db=Depends(get_db), principal: Principal = Depends(get_principal)):
+def create_user(body: UserCreate, request: Request, db=Depends(get_db),
+                principal: Principal = Depends(get_principal)):
     require_admin(principal)
     name = checked(normalize_username, body.username)
     checked(validate_password, body.password)
     if body.role not in ("admin", "member"):
         raise ApiError(422, "role must be admin or member")
+    with hashing_slot(request):
+        password_hash = hash_password(body.password)
     if db.scalar(select(User).where(User.username == name)):
         raise ApiError(409, "username already exists")
-    user = User(username=name, password_hash=hash_password(body.password), role=body.role, active=body.active)
+    user = User(username=name, password_hash=password_hash, role=body.role, active=body.active)
     db.add(user)
     db.commit()
     return user_item(user)
 
 
+def clear_login_failures(db, *usernames):
+    db.execute(delete(LoginFailure).where(LoginFailure.kind == "user", LoginFailure.key.in_(set(usernames))))
+
+
 @router.patch("/users/{user_id}")
-def update_user(user_id: int, body: UserPatch, db=Depends(get_db), principal: Principal = Depends(get_principal)):
+def update_user(user_id: int, body: UserPatch, request: Request, db=Depends(get_db),
+                principal: Principal = Depends(get_principal)):
     require_admin(principal)
+    password_hash = None
+    if body.password is not None:
+        checked(validate_password, body.password)
+        with hashing_slot(request):
+            password_hash = hash_password(body.password)
     user = db.get(User, user_id)
     if user is None:
         raise ApiError(404, "user not found")
+    previous_name = user.username
     revoke = False
     if body.username is not None:
         name = checked(normalize_username, body.username)
@@ -182,13 +272,13 @@ def update_user(user_id: int, body: UserPatch, db=Depends(get_db), principal: Pr
             raise ApiError(409, "cannot deactivate the last active admin")
         revoke = revoke or not body.active
         user.active = body.active
-    if body.password is not None:
-        checked(validate_password, body.password)
-        user.password_hash = hash_password(body.password)
+    if password_hash is not None:
+        user.password_hash = password_hash
         revoke = True
     if revoke:
         keep = principal.session.id if user.id == principal.user.id and user.active else None
         db.execute(delete(SessionToken).where(SessionToken.user_id == user.id, SessionToken.id != (keep or -1)))
+    clear_login_failures(db, previous_name, user.username)
     user.updated_at = utcnow()
     db.commit()
     return user_item(user)

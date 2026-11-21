@@ -48,8 +48,11 @@ class SessionToken(Base):
 
 
 class LoginFailure(Base):
+    """Failed sign-in counter. `kind` separates account buckets ("user") from client buckets
+    ("client"), so a username can never collide with a client address."""
     __tablename__ = "login_failures"
-    username: Mapped[str] = mapped_column(String(64), primary_key=True)
+    kind: Mapped[str] = mapped_column(String(8), primary_key=True)
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
     failures: Mapped[int] = mapped_column(Integer, default=0)
     first_failure_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     locked_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
@@ -62,6 +65,7 @@ class Project(Base):
     name: Mapped[str] = mapped_column(String(200))
     repository_url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     default_branch: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    scan_path: Mapped[str | None] = mapped_column(String(4096), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
 
@@ -74,7 +78,7 @@ class ApiToken(Base):
     prefix: Mapped[str] = mapped_column(String(16))
     scopes: Mapped[list] = mapped_column(JSON)
     project_id: Mapped[int | None] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), nullable=True)
-    created_by_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    created_by_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
@@ -186,6 +190,9 @@ class Schedule(Base):
     project_id: Mapped[int] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
     cron: Mapped[str] = mapped_column(String(128))
     source: Mapped[dict] = mapped_column(JSON)
+    # True when an admin set the source: path sources then need only the scan roots, otherwise
+    # they must stay inside the project's scan_path at every run.
+    admin_source: Mapped[bool] = mapped_column(Boolean, default=False)
     options: Mapped[dict] = mapped_column(JSON)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     next_run_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)

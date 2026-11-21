@@ -35,6 +35,23 @@ def get_db(request: Request):
         db.close()
 
 
+def creator_still_entitled(db, token):
+    """Tokens created through the API stay valid only while their creator could create them now:
+    the creator is active, and a non-admin creator still maintains the token's project. Global
+    tokens need an admin creator. CLI-created tokens have no creator and are unaffected."""
+    if token.created_by_id is None:
+        return True
+    creator = db.get(User, token.created_by_id)
+    if creator is None or not creator.active:
+        return False
+    if creator.role == "admin":
+        return True
+    if token.project_id is None:
+        return False
+    return db.scalar(select(Membership.role).where(Membership.project_id == token.project_id,
+                                                   Membership.user_id == creator.id)) == "maintainer"
+
+
 def get_principal(request: Request, db=Depends(get_db)):
     """Resolve the bearer secret to a user session or an API token. The transaction ends before
     returning so long request bodies never hold a database lock."""
@@ -47,7 +64,7 @@ def get_principal(request: Request, db=Depends(get_db)):
     principal = None
     if secret.startswith(TOKEN_PREFIX):
         token = db.scalar(select(ApiToken).where(ApiToken.token_hash == hashed))
-        if token is not None and same(token.token_hash, hashed):
+        if token is not None and same(token.token_hash, hashed) and creator_still_entitled(db, token):
             if token.last_used_at is None or now - token.last_used_at > timedelta(minutes=1):
                 token.last_used_at = now
             principal = Principal(token=token)
@@ -122,7 +139,7 @@ def visible_projects(principal):
 
 
 class Paging:
-    def __init__(self, page: int = Query(1, ge=1), page_size: int = Query(50, ge=1, le=500)):
+    def __init__(self, page: int = Query(1, ge=1, le=100000), page_size: int = Query(50, ge=1, le=500)):
         self.page = page
         self.size = page_size
 

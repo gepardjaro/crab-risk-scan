@@ -42,7 +42,8 @@ def run_serve(args):
     except RuntimeError as exc:
         print(f"Server start failed: {exc}", file=sys.stderr)
         return 2
-    uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)
+    uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level,
+                forwarded_allow_ips=args.forwarded_allow_ips)
     return 0
 
 
@@ -76,6 +77,9 @@ def run_admin(args):
             if password is None:
                 return 2
             print(f"Password updated for {admin.set_password(settings, args.username, password)}; sessions revoked.")
+        elif args.admin_command == "unlock":
+            name, removed = admin.unlock(settings, args.username)
+            print(f"Sign-in lockout cleared for {name}." if removed else f"{name} had no recorded sign-in failures.")
         elif args.admin_command == "create-token":
             print(admin.create_token(settings, args.name, args.scope, args.project))
             print("Store this token now. It is not shown again.", file=sys.stderr)
@@ -107,6 +111,10 @@ def add_cli(subparsers):
     serve.add_argument("--log-level", default="info", choices=("critical", "error", "warning", "info", "debug"))
     serve.add_argument("--no-scheduler", action="store_true",
                        help="do not run the schedule and lease-expiry loop in this instance")
+    serve.add_argument("--forwarded-allow-ips", metavar="ADDRESSES",
+                       help="comma-separated reverse proxy addresses trusted for X-Forwarded-For and "
+                            "X-Forwarded-Proto, or '*' (default: FORWARDED_ALLOW_IPS or 127.0.0.1). Sign-in "
+                            "throttling per client relies on it behind a proxy")
     serve.set_defaults(handler=run_serve)
 
     command = subparsers.add_parser("worker", help="claim and run scan jobs from a CRAB server")
@@ -122,12 +130,14 @@ def add_cli(subparsers):
     set_password = actions.add_parser("set-password", help="set a user's password and revoke their sessions")
     set_password.add_argument("username")
     set_password.add_argument("--password-stdin", action="store_true", help="read the password from standard input")
+    unlock = actions.add_parser("unlock", help="clear a user's failed sign-in counter and lockout")
+    unlock.add_argument("username")
     create_token = actions.add_parser("create-token", help="create an API token and print it once")
     create_token.add_argument("name")
     create_token.add_argument("--scope", action="append", required=True, choices=("scan:upload", "worker", "read"))
     create_token.add_argument("--project", metavar="KEY", help="bind the token to one project")
     list_tokens = actions.add_parser("list-tokens", help="list API tokens without their secrets")
     list_tokens.add_argument("--project", metavar="KEY")
-    for parser in (create_user, set_password, create_token, list_tokens):
+    for parser in (create_user, set_password, unlock, create_token, list_tokens):
         _storage_options(parser)
     admin.set_defaults(handler=run_admin)

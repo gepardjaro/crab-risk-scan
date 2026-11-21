@@ -58,9 +58,9 @@ try:
     from sqlalchemy import select, update
 
     from crab_risk_scan.server.config import Settings
-    from crab_risk_scan.server.db import Job, Project, Schedule, initialize, make_engine, utcnow
+    from crab_risk_scan.server.db import Job, LoginFailure, Project, Schedule, initialize, make_engine, utcnow
     from crab_risk_scan.server.scheduler import Scheduler
-    from crab_risk_scan.server.service import enqueue_due
+    from crab_risk_scan.server.service import enqueue_due, prune_login_failures
     SERVER = True
 except ImportError:  # the server extra is optional
     SERVER = False
@@ -85,7 +85,7 @@ class EnqueueTests(unittest.TestCase):
             db.flush()
             self.schedule = Schedule(project_id=project.id, cron="*/5 * * * *",
                                      source={"type": "path", "path": self.path}, options={"engines": "none"},
-                                     enabled=True, next_run_at=utcnow() - timedelta(minutes=1))
+                                     admin_source=True, enabled=True, next_run_at=utcnow() - timedelta(minutes=1))
             db.add(self.schedule)
             db.commit()
 
@@ -163,6 +163,48 @@ class EnqueueTests(unittest.TestCase):
             db.commit()
         self.assertEqual(scheduler.tick(), [])
         self.assertEqual(self.jobs()[0].status, "queued")
+
+    def test_member_schedules_need_the_project_scan_path_at_run_time(self):
+        with self.instances[0]() as db:
+            db.execute(update(Schedule).values(admin_source=False))
+            db.commit()
+            enqueue_due(db, self.settings)
+        job = self.jobs()[0]
+        self.assertEqual(job.status, "failed")
+        self.assertIn("scan_path", job.error)
+        with self.instances[0]() as db:
+            db.execute(update(Project).values(scan_path=self.path))
+            db.execute(update(Schedule).values(next_run_at=utcnow() - timedelta(minutes=1)))
+            db.commit()
+            enqueue_due(db, self.settings)
+        self.assertEqual(sorted(job.status for job in self.jobs()), ["failed", "queued"])
+
+    def test_git_schedules_follow_the_current_host_policy(self):
+        with self.instances[0]() as db:
+            db.execute(update(Schedule).values(source={"type": "git", "url": "https://git.example.com/r.git"}))
+            db.commit()
+            enqueue_due(db, self.settings)
+        job = self.jobs()[0]
+        self.assertEqual(job.status, "failed")
+        self.assertIn("CRAB_GIT_HOSTS", job.error)
+
+    def test_scheduler_tick_prunes_expired_login_failures(self):
+        now = utcnow()
+        window = timedelta(seconds=self.settings.login_lockout_seconds)
+        with self.instances[0]() as db:
+            db.add_all([
+                LoginFailure(kind="user", key="stale", failures=2, first_failure_at=now - window * 2),
+                LoginFailure(kind="client", key="10.0.0.1", failures=9, first_failure_at=now - window * 2,
+                             locked_until=now - timedelta(seconds=1)),
+                LoginFailure(kind="user", key="locked", failures=5, first_failure_at=now - window * 2,
+                             locked_until=now + timedelta(minutes=5)),
+                LoginFailure(kind="user", key="recent", failures=1, first_failure_at=now),
+            ])
+            db.commit()
+        Scheduler(self.instances[0], self.settings).tick()
+        with self.instances[0]() as db:
+            self.assertEqual(sorted(row.key for row in db.scalars(select(LoginFailure))), ["locked", "recent"])
+            self.assertEqual(prune_login_failures(db, self.settings), 0)
 
     def test_background_thread_starts_and_stops(self):
         scheduler = Scheduler(self.instances[0], Settings(database_url=self.url, data_dir=self.settings.data_dir,

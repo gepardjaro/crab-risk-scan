@@ -44,9 +44,21 @@ def set_password(settings, username, password):
         user.password_hash = hash_password(password)
         user.updated_at = utcnow()
         db.execute(delete(SessionToken).where(SessionToken.user_id == user.id))
-        db.execute(delete(LoginFailure).where(LoginFailure.username == name))
+        db.execute(delete(LoginFailure).where(LoginFailure.kind == "user", LoginFailure.key == name))
         db.commit()
     return name
+
+
+def unlock(settings, username):
+    """Clear the sign-in failure counter and lockout of one account. Returns whether one existed."""
+    name = (username or "").strip().lower()[:64]
+    if not name:
+        raise AdminError("username is required")
+    with _sessions(settings)() as db:
+        removed = db.execute(delete(LoginFailure).where(LoginFailure.kind == "user",
+                                                        LoginFailure.key == name)).rowcount
+        db.commit()
+    return name, bool(removed)
 
 
 def create_token(settings, name, scopes, project=None):

@@ -1,7 +1,9 @@
 """FastAPI application factory."""
 import sys
+import threading
 from contextlib import asynccontextmanager
 
+import anyio
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy import func, select
@@ -16,6 +18,7 @@ from .security import generated_password, hash_password, normalize_username, val
 from .service import ApiError
 
 API_PREFIX = "/api/v1"
+BODY_PARSE_SLOTS = 2
 SPA_POLICY = ("default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; "
               "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
 
@@ -66,11 +69,14 @@ def create_app(settings=None):
                 scheduler.stop()
             engine.dispose()
 
-    app = FastAPI(title="CRAB", version=__version__, lifespan=lifespan, docs_url="/api/docs",
-                  openapi_url="/api/openapi.json", redoc_url=None)
+    docs = settings.api_docs
+    app = FastAPI(title="CRAB", version=__version__, lifespan=lifespan, docs_url="/api/docs" if docs else None,
+                  openapi_url="/api/openapi.json" if docs else None, redoc_url=None)
     app.state.settings = settings
     app.state.engine = engine
     app.state.sessions = sessions
+    app.state.hash_slots = threading.BoundedSemaphore(settings.password_hash_concurrency)
+    app.state.body_slots = anyio.Semaphore(BODY_PARSE_SLOTS)
 
     @app.exception_handler(ApiError)
     async def api_error(request: Request, exc: ApiError):
