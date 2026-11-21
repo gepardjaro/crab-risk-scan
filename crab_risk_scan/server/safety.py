@@ -14,6 +14,21 @@ def within(path, root):
     return child == parent or child.startswith(parent.rstrip("\\/") + os.sep)
 
 
+def contained(path, roots):
+    """True when `path` lies inside one of the admin-configured `roots`.
+
+    The path must first be lexically inside a root as configured or as resolved: temporary
+    folders are reached through aliases (macOS /var and /private/var, Windows 8.3 short names).
+    Only then is the path resolved, and the result must stay inside the resolved root, which
+    catches symlink escapes. realpath therefore never runs on a path outside a local root.
+    """
+    roots = [str(root) for root in roots]
+    if not any(within(path, form) for root in roots for form in (root, os.path.realpath(root))):
+        return False
+    real = os.path.realpath(path)
+    return any(within(real, os.path.realpath(root)) for root in roots)
+
+
 def blocked_address(address):
     """Loopback, link-local, unspecified, multicast and reserved addresses, including IPv4-mapped IPv6."""
     if address.version == 6 and address.ipv4_mapped is not None:

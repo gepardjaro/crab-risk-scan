@@ -21,7 +21,7 @@ try:
     from fastapi.testclient import TestClient
     from sqlalchemy import select, update
 
-    from crab_risk_scan.server import api_auth, api_projects, cli, service
+    from crab_risk_scan.server import api_auth, api_projects, cli, safety, service
     from crab_risk_scan.server.app import bootstrap_admin, create_app
     from crab_risk_scan.server.config import UPLOAD_LIMIT, Settings, parse_git_hosts
     from crab_risk_scan.server.db import ApiToken, Job, LoginFailure, Schedule, SessionToken, utcnow
@@ -48,7 +48,7 @@ class ServerCase(unittest.TestCase):
         self.repos = self.base / "repos"
         (self.repos / "demo").mkdir(parents=True)
         values = dict(database_url=f"sqlite:///{(self.base / 'crab.db').as_posix()}", data_dir=self.base,
-                      scan_roots=(Path(os.path.realpath(self.repos)),), admin_password=ADMIN_PASSWORD,
+                      scan_roots=(self.repos,), admin_password=ADMIN_PASSWORD,
                       scheduler=False, static_dir=self.base / "static", lease_seconds=30)
         values.update(self.settings_overrides)
         self.settings = Settings(**values)
@@ -939,8 +939,33 @@ class PathSourceTests(ServerCase):
 
     def test_outside_paths_are_rejected_before_resolving(self):
         outside = str(self.base / "elsewhere")
-        with mock.patch("os.path.realpath", side_effect=AssertionError("realpath called")):
+        original = os.path.realpath
+
+        def guarded(path, *args, **kwargs):
+            if os.fspath(path).startswith(outside):
+                raise AssertionError("realpath called for the job path")
+            return original(path, *args, **kwargs)
+        with mock.patch("os.path.realpath", side_effect=guarded):
             self.assertEqual(self.path_job(outside).status_code, 422)
+
+    def test_containment_accepts_root_aliases_and_catches_symlink_escapes(self):
+        # macOS reaches /var through /private/var and Windows temp folders appear as 8.3 short
+        # names, so paths may arrive in the configured or the resolved form of a root.
+        alias, real = os.path.normpath("/alias/scan"), os.path.normpath("/real/scan")
+        links = {alias: real, os.path.join(alias, "demo"): os.path.join(real, "demo"),
+                 os.path.join(real, "demo"): os.path.join(real, "demo"),
+                 os.path.join(alias, "escape"): os.path.normpath("/etc")}
+
+        def resolve(path, *args, **kwargs):
+            path = os.path.normpath(os.fspath(path))
+            if path not in links:
+                raise AssertionError(f"realpath called for {path!r}")
+            return links[path]
+        with mock.patch("os.path.realpath", side_effect=resolve):
+            self.assertTrue(safety.contained(os.path.join(alias, "demo"), [alias]))
+            self.assertTrue(safety.contained(os.path.join(real, "demo"), [alias]))
+            self.assertFalse(safety.contained(os.path.join(alias, "escape"), [alias]))
+            self.assertFalse(safety.contained(os.path.normpath("/elsewhere/demo"), [alias]))
 
 
 class TokenLifecycleTests(ServerCase):

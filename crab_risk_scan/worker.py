@@ -21,7 +21,7 @@ from urllib.parse import urlsplit
 
 from . import __version__
 from .server.config import parse_git_hosts
-from .server.safety import blocked_address, host_allowed, unc_or_device, within
+from .server.safety import blocked_address, contained, host_allowed, unc_or_device
 
 LOG_LIMIT = 64 * 1024
 ERROR_LIMIT = 2000
@@ -196,11 +196,9 @@ class Worker:
             raise JobError("source path must not be a UNC or device path")
         if not os.path.isabs(path):
             raise JobError("source path must be absolute")
-        if not any(within(path, root) for root in self.scan_roots):
+        if not contained(path, self.scan_roots):
             raise JobError("source path is outside this worker's scan roots")
         real = Path(os.path.realpath(path))
-        if not any(within(str(real), root) for root in self.scan_roots):
-            raise JobError("source path is outside this worker's scan roots")
         if not real.is_dir():
             raise JobError("source path is not a directory on this worker")
         return real
@@ -427,7 +425,8 @@ def scan_roots(values):
     for value in values:
         if not value.is_absolute():
             raise ValueError(f"scan roots must be absolute paths: {value}")
-        roots.append(Path(os.path.realpath(value)))
+        # Keep the configured form: containment also compares against the resolved form.
+        roots.append(Path(os.path.normpath(value)))
     return roots
 
 

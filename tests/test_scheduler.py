@@ -75,7 +75,7 @@ class EnqueueTests(unittest.TestCase):
         (root / "demo").mkdir(parents=True)
         self.path = str(root / "demo")
         self.url = f"sqlite:///{(base / 'crab.db').as_posix()}"
-        self.settings = Settings(database_url=self.url, data_dir=base, scan_roots=(Path(os.path.realpath(root)),),
+        self.settings = Settings(database_url=self.url, data_dir=base, scan_roots=(root,),
                                  scheduler=False)
         self.engines = [make_engine(self.url) for _ in range(4)]
         self.instances = [initialize(engine) for engine in self.engines]

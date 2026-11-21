@@ -32,7 +32,8 @@ def parse_scan_roots(value):
         path = Path(part)
         if not path.is_absolute():
             raise ValueError(f"scan roots must be absolute paths: {part}")
-        roots.append(Path(os.path.realpath(path)))
+        # Keep the configured form: containment also compares against the resolved form.
+        roots.append(Path(os.path.normpath(path)))
     return tuple(roots)
 
 

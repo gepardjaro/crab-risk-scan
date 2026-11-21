@@ -85,9 +85,15 @@ class WorkerUnitTests(unittest.TestCase):
                          "\\\\.\\pipe\\crab", "\\\\?\\" + str(self.root / "demo")):
                 with self.subTest(path=path), self.assertRaisesRegex(JobError, "UNC or device"):
                     self.worker.resolve_path(path)
-        with mock.patch("os.path.realpath", side_effect=AssertionError("realpath called")):
+        outside = str(Path(self.temp.name) / "elsewhere")
+
+        def outside_guard(path, *args, **kwargs):
+            if os.fspath(path).startswith(outside):
+                raise AssertionError("realpath called for the job path")
+            return original(path, *args, **kwargs)
+        with mock.patch("os.path.realpath", side_effect=outside_guard):
             with self.assertRaisesRegex(JobError, "outside"):
-                self.worker.resolve_path(str(Path(self.temp.name) / "elsewhere"))
+                self.worker.resolve_path(outside)
 
     def git_worker(self, git_hosts=()):
         return Worker(Client("http://127.0.0.1:9", "crab_x"), "unit", allow_git=True, git_hosts=git_hosts,

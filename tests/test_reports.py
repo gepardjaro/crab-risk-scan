@@ -383,7 +383,8 @@ class NetworkPathTests(unittest.TestCase):
                 buffer.value.upper() == str(self.root).upper():
             self.skipTest("8.3 short names are disabled on this volume")
         short = Path(buffer.value)
-        self.assertEqual(evidence.relative_path(str(self.root / "client.py"), short), "client.py")
+        long = Path(os.path.realpath(self.root))
+        self.assertEqual(evidence.relative_path(str(long / "client.py"), short), "client.py")
         self.assertEqual(evidence.relative_path(str(short / "client.py"), short), "client.py")
 
 

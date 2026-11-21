@@ -17,7 +17,7 @@ from sqlalchemy import and_, delete, func, not_, or_, select, update
 
 from .cron import CronExpression
 from .db import Finding, Job, LoginFailure, Project, ProjectException, Scan, Schedule, Worker, utcnow
-from .safety import blocked_address, host_allowed, unc_or_device, within
+from .safety import blocked_address, contained, host_allowed, unc_or_device
 
 SEVERITIES = ("critical", "high", "medium", "low", "info", "unknown")
 CATEGORIES = ("sast", "secrets", "iac", "sca", "container")
@@ -368,12 +368,8 @@ def checked_path(path, label):
 
 
 def inside(path, roots):
-    """Containment in `roots`: lexical first, then the resolved path. realpath runs only on
-    paths that are already lexically inside a root, so it never reaches the network."""
-    if not any(within(path, root) for root in roots):
-        return False
-    real = os.path.realpath(path)
-    return any(within(real, os.path.realpath(root)) for root in roots)
+    """Containment in admin-configured roots, lexical before resolved (see safety.contained)."""
+    return contained(path, roots)
 
 
 def validate_scan_path(value, scan_roots):
