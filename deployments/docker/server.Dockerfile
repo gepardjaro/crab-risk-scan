@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.7
+# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
 #
 # CRAB server image: the API, the WebUI, the scheduler and the admin CLI.
 # Build from the repository root:
@@ -7,7 +7,7 @@
 #
 # Workers run on the scanner image (deployments/docker/scanner.Dockerfile), which carries the engines.
 
-ARG NODE_IMAGE=node:24-slim
+ARG NODE_IMAGE=node:24-slim@sha256:dc26ae92c9fb15cf6b1d63e20f0944b2efe0f115b20e00be48fb23fceb061c54
 ARG PYTHON_IMAGE=python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
 
 # Stage 1: build the WebUI into crab_risk_scan/server/static/.
@@ -18,17 +18,20 @@ RUN npm ci --no-audit --no-fund
 COPY web/ ./
 RUN npm run build
 
-# Stage 2: install CRAB with the server, DOCX and PostgreSQL extras into a virtual environment.
+# Stage 2: install the hash-locked dependencies for the server, DOCX and PostgreSQL extras, then CRAB
+# itself without dependency resolution or build isolation.
 FROM ${PYTHON_IMAGE} AS build
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1 \
     PYTHONDONTWRITEBYTECODE=1
 WORKDIR /src
+COPY deployments/docker/requirements-server.txt /tmp/requirements.txt
 COPY pyproject.toml LICENSE README.md ./
 COPY crab_risk_scan/ crab_risk_scan/
 COPY --from=web /src/crab_risk_scan/server/static/ crab_risk_scan/server/static/
 RUN python -m venv /opt/crab/venv \
-    && /opt/crab/venv/bin/pip install ".[server,docx,postgres]" \
+    && /opt/crab/venv/bin/pip install --require-hashes --no-deps -r /tmp/requirements.txt \
+    && /opt/crab/venv/bin/pip install --no-deps --no-build-isolation . \
     && test -f /opt/crab/venv/lib/python3*/site-packages/crab_risk_scan/server/static/index.html
 
 # Stage 3: runtime as a non-root user.

@@ -32,6 +32,8 @@ pipeline {
         CRAB_EXCEPTIONS = ''
         CRAB_FAIL_ON = ''
         CRAB_SBOM = 'false'
+        // Empty uses WORKSPACE_TMP/crab-cache. The container runs as the agent's uid, which cannot
+        // write the image's cache (owned by uid 10001), so the job always brings its own cache.
         CRAB_CACHE_DIR = ''
         CRAB_SERVER_URL = ''
         CRAB_PROJECT = ''
@@ -48,7 +50,9 @@ pipeline {
                     if (env.CRAB_EXCEPTIONS) { args += ['--exceptions', env.CRAB_EXCEPTIONS] }
                     if (env.CRAB_FAIL_ON) { args += ['--fail-on', env.CRAB_FAIL_ON] }
                     if (env.CRAB_SBOM == 'true') { args += ['--sbom'] }
-                    if (env.CRAB_CACHE_DIR) { args += ['--cache-dir', env.CRAB_CACHE_DIR] }
+                    def cacheDir = env.CRAB_CACHE_DIR ?: "${env.WORKSPACE_TMP}/crab-cache"
+                    sh 'mkdir -p ' + shellQuote(cacheDir)
+                    args += ['--cache-dir', cacheDir]
                     if (env.CRAB_SERVER_URL) { args += ['--server', env.CRAB_SERVER_URL, '--project', env.CRAB_PROJECT] }
                     def command = 'crab-risk-scan ' + args.collect { shellQuote(it) }.join(' ')
                     // A stale results folder in a persistent workspace would be scanned as plain files.

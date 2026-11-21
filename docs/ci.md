@@ -13,7 +13,7 @@ crab-risk-scan ci . --policy .crab/policy.json --exceptions .crab/exceptions.jso
 | Flag | Default | Effect |
 |---|---|---|
 | `--output-dir DIR` | `crab-results` | Artifact folder |
-| `--server URL` | none | CRAB server base URL. Enables connected mode and requires `--project`. |
+| `--server URL` | none | CRAB server base URL. Enables connected mode and requires `--project`. Must use `https`, except for a loopback address, because the bearer token would otherwise cross the network unencrypted. |
 | `--project KEY` | none | Server project that receives the scan |
 | `--token TOKEN` | `CRAB_TOKEN` | API token with the `scan:upload` scope. Prefer the environment variable, because command lines appear in process listings. |
 | `--annotations N` | 50 | Maximum number of unsuppressed findings shown as annotations or console lines |
@@ -76,6 +76,16 @@ GitHub outputs: `exit-code`, `passed`, `actionable`, `suppressed`, `findings`, `
 
 Exit 2 takes precedence. `--no-fail` never hides an incomplete scan.
 
+## Trusted baselines
+
+`--new-since` compares the scan with a baseline report. Policies with `new_only` gates fail only on findings that are not in the baseline, so the baseline decides what the gate ignores. A baseline from the scanned branch, a pull request or the checkout itself lets the code under review hide its own findings.
+
+| Rule | Why |
+|---|---|
+| Take the baseline from a protected branch, for example a workflow artifact of the last `main` run | Only reviewed code produced it |
+| Never read the baseline from the checked-out tree of a pull request | The author controls that file |
+| Download it in a step the pull request cannot change, with a token limited to reading artifacts | The download step is part of the trust boundary |
+
 ## Standalone and connected modes
 
 Standalone mode is the default. The scan runs offline and nothing leaves the job except the artifacts the CI system stores.
@@ -99,10 +109,12 @@ Create a project token with the `scan:upload` scope in the WebUI project setting
 
 | Property | Value |
 |---|---|
-| Base | `python:3.13-slim`, pinned by digest |
+| Base | `python:3.13-slim`, pinned by digest. Dockerfile frontend `docker/dockerfile:1.7`, pinned by digest. |
+| Python dependencies | Hash-locked in `deployments/docker/requirements-scanner.txt`, installed with `pip install --require-hashes --no-deps`. CRAB itself is installed with `--no-deps --no-build-isolation`. |
 | Engines | `crab-risk-scan engines install --dest /opt/crab/engines`, checksum-verified. `CRAB_ENGINE_DIR=/opt/crab/engines/bin`. |
-| Databases | `CRAB_CACHE_DIR=/opt/crab/cache` |
-| User | `crab`, uid and gid 10001. Runs under any uid. |
+| Databases | `CRAB_CACHE_DIR=/opt/crab/cache`, owned by uid 10001, mode 0755. Other uids can read but not write it. |
+| User | `crab`, uid and gid 10001. Runs under any uid; other uids need their own cache directory. |
+| Build context | Only `pyproject.toml`, `LICENSE`, `README.md`, `crab_risk_scan/` and the requirement file are copied. `.dockerignore` also excludes `.env` files, `scan/` and `.crab-cache`. |
 | Entrypoint | `crab-risk-scan`, working directory `/work` |
 
 | Build argument | Default | Effect |
@@ -113,8 +125,61 @@ Create a project token with the `scan:upload` scope in the WebUI project setting
 
 ```sh
 docker build -f deployments/docker/scanner.Dockerfile --build-arg INSTALL_PWSH=true -t crab-risk-scan .
-docker run --rm --network none --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$PWD:/work" crab-risk-scan ci .
+mkdir -p "$HOME/crab-results" "$HOME/crab-cache"
+docker run --rm --network none --cap-drop ALL --security-opt no-new-privileges --user "$(id -u):$(id -g)" -e HOME=/tmp \
+  -v "$PWD:/work:ro" -v "$HOME/crab-results:/out" -v "$HOME/crab-cache:/cache" \
+  crab-risk-scan ci . --output-dir /out --cache-dir /cache
 ```
+
+The CI templates run the container under the host uid so results stay writable. They therefore mount their own cache directory. A database prefetched into the image (`PREFETCH_DB=true`) is used only when the container runs as uid 10001, for example in the GitLab template.
+
+### Hash-locked image requirements
+
+The server image uses `deployments/docker/requirements-server.txt` (server, DOCX and PostgreSQL extras), the scanner image `requirements-scanner.txt` (DOCX extra). Both include `setuptools` from `deployments/docker/build-requirements.in`, which must equal the `[build-system]` pin in `pyproject.toml`. The files are universal: one set of hashes covers `linux/amd64` and `linux/arm64`. Regenerate them after any dependency change, with `uv` installed in a throwaway virtual environment outside the repository:
+
+```sh
+python -m venv /tmp/uv-venv && /tmp/uv-venv/bin/pip install uv
+for spec in "scanner --extra docx" "server --extra server --extra docx --extra postgres"; do
+  set -- $spec; name=$1; shift
+  /tmp/uv-venv/bin/uv pip compile pyproject.toml deployments/docker/build-requirements.in "$@" \
+    --universal --python-version 3.13 --generate-hashes \
+    --custom-compile-command "see docs/ci.md (Hash-locked image requirements)" \
+    -o "deployments/docker/requirements-$name.txt"
+done
+rm -rf /tmp/uv-venv
+```
+
+### Pinned image inputs
+
+| Input | Where |
+|---|---|
+| `python:3.13-slim`, `node:24-slim`, `docker/dockerfile:1.7` | `PYTHON_IMAGE`, `NODE_IMAGE` and `# syntax=` in both Dockerfiles |
+| `postgres:17-alpine` | `compose.yaml` |
+| `tonistiigi/binfmt`, `moby/buildkit` | `setup-qemu-action` `image` and `setup-buildx-action` `driver-opts` in `release.yml` |
+
+All are pinned to the multi-arch index digest. To update one, read the digest from the registry, for example `docker buildx imagetools inspect node:24-slim`, and replace tag and digest together. `tests/test_delivery.py` fails on an unpinned image.
+
+### Verifying published images
+
+Pin the image by digest and verify its provenance before use:
+
+```sh
+gh attestation verify oci://ghcr.io/jarhu/crab-risk-scan:0.3.0 --repo jarhu/crab-risk-scan
+docker buildx imagetools inspect ghcr.io/jarhu/crab-risk-scan:0.3.0 --format '{{json .Manifest.Digest}}'
+```
+
+Use the verified digest as `ghcr.io/jarhu/crab-risk-scan:0.3.0@sha256:...` in `image-tag` (GitHub, as `0.3.0@sha256:...`), `image` (Azure), `CRAB_IMAGE` (GitLab, Jenkins) or the pre-commit `entry`.
+
+### Release settings
+
+The release workflow publishes only tags whose commit is an ancestor of `origin/main`. It also needs these repository settings:
+
+| Setting | Value |
+|---|---|
+| Environment `pypi` | Required reviewers. Deployment tag rule `v*`. |
+| Environment `release` | Required reviewers. Deployment tag rule `v*`. Gates the image publication. |
+| Tag ruleset | Restrict creation, update and deletion of `v*` tags to maintainers |
+| PyPI | Trusted publisher for this repository, workflow `release.yml`, environment `pypi` |
 
 ## GitHub Actions
 
@@ -129,6 +194,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: actions/cache@v6
         with:
           path: ${{ runner.temp }}/crab-cache
@@ -157,10 +224,12 @@ jobs:
 | `upload-sarif`, `sarif-category` | `true`, `crab-risk-scan` | Code scanning upload. Needs `security-events: write`. |
 | `artifact-name` | `crab-results` | Workflow artifact. Empty disables it. |
 | `server-url`, `project`, `token`, `require-upload` | none | Connected mode |
-| `image`, `image-tag` | `ghcr.io/jarhu/crab-risk-scan`, the action's version | Scanner image |
+| `image`, `image-tag` | `ghcr.io/jarhu/crab-risk-scan`, `0.3.0` (the release version) | Scanner image. `image-tag` accepts `TAG` or `TAG@sha256:DIGEST`. |
 | `args` | none | Extra `ci` arguments, split on spaces |
 
-Policy, exception and baseline paths must be inside the workspace, which is the only mounted directory besides `$RUNNER_TEMP`. Code scanning resolves SARIF locations against the repository root, so scan the repository root when you rely on code scanning alerts. Annotations handle subdirectories.
+`persist-credentials: false` keeps the checkout token out of `.git/config`, where the scanned tree and its engines could read it. When you pin the action by commit SHA, the image tag still defaults to the release version of that commit, never `latest`. Pin `image-tag` with a digest for immutable runs.
+
+The container gets the workspace read-only. Only the results folder, the cache directory and the `GITHUB_OUTPUT` and `GITHUB_STEP_SUMMARY` files are writable, and it runs with `--cap-drop ALL` and `no-new-privileges`. Policy, exception and baseline paths must be inside the workspace. Code scanning resolves SARIF locations against the repository root, so scan the repository root when you rely on code scanning alerts. Annotations handle subdirectories.
 
 ## GitLab CI
 
@@ -187,6 +256,8 @@ variables:
 
 Set `CRAB_TOKEN` as a masked CI/CD variable and `CRAB_SERVER_URL` and `CRAB_PROJECT` for connected mode. The scanner image runs as uid 10001. The GitLab Docker executor's default umask makes the checkout writable for it.
 
+The cache key includes `CI_COMMIT_REF_PROTECTED`. Only branch pipelines on protected branches push the cache (`policy: pull-push`); merge request, unprotected and tag pipelines only pull it. `crab-scan` refuses to run when `CRAB_CACHE_DIR` is a symlink, is tracked by git or is not a directory, because the scanned repository would then supply the vulnerability databases.
+
 ## Azure Pipelines
 
 `integrations/azure-devops/crab-scan.yml` is a steps template for Linux agents with Docker.
@@ -212,11 +283,11 @@ steps:
       updateDb: true
 ```
 
-The scan step publishes `report.sarif` as the `CodeAnalysisLogs` build artifact, which the SARIF SAST Scans Tab extension displays, and the full folder as the `crab-results` pipeline artifact. The gate step runs `crab-risk-scan gate`. Set `gate: false` to skip it. Relative `cacheDir` paths resolve against `$(Pipeline.Workspace)`. For connected mode, set `serverUrl` and `project` and define the secret variable named by `tokenVariable` (default `CRAB_TOKEN`).
+The scan step publishes `report.sarif` as the `CodeAnalysisLogs` build artifact, which the SARIF SAST Scans Tab extension displays, and the full folder as the `crab-results` pipeline artifact. The gate step runs `crab-risk-scan gate`. Set `gate: false` to skip it. Relative `cacheDir` paths resolve against `$(Pipeline.Workspace)`; without `cacheDir` the step uses an empty cache in `$(Agent.TempDirectory)`. The sources are mounted read-only; only the results folder and the cache are writable. For connected mode, set `serverUrl` and `project` and define the secret variable named by `tokenVariable` (default `CRAB_TOKEN`).
 
 ## Jenkins
 
-`integrations/jenkins/Jenkinsfile` needs the Docker Pipeline plugin and a Linux agent with Docker. The scan stage removes any stale results folder, runs `ci --no-fail`, archives the folder and records the SARIF findings with the Warnings Next Generation plugin. The gate stage runs `crab-risk-scan gate`. The console shows the runner summary. For connected mode, set `CRAB_SERVER_URL` and `CRAB_PROJECT` and store the token as a Secret text credential named by `CRAB_TOKEN_CREDENTIAL`.
+`integrations/jenkins/Jenkinsfile` needs the Docker Pipeline plugin and a Linux agent with Docker. The scan stage removes any stale results folder, runs `ci --no-fail`, archives the folder and records the SARIF findings with the Warnings Next Generation plugin. The gate stage runs `crab-risk-scan gate`. The console shows the runner summary. An empty `CRAB_CACHE_DIR` uses `$WORKSPACE_TMP/crab-cache`. For connected mode, set `CRAB_SERVER_URL` and `CRAB_PROJECT` and store the token as a Secret text credential named by `CRAB_TOKEN_CREDENTIAL`.
 
 ## pre-commit
 
@@ -246,7 +317,7 @@ Trivy and OSV-Scanner read local databases. `crab-risk-scan db update` is the on
 | CI cache | Restore a cache directory, run `db update` into it with network access, then scan offline with `--cache-dir`. The templates do this with `update-db`, `CRAB_UPDATE_DB` and `updateDb`. |
 | Air-gapped | Run `db update` on a connected host, copy the cache directory into the CI environment and pass `--cache-dir` or set `CRAB_CACHE_DIR` |
 
-The cache must be outside the scanned directory. CRAB refuses a cache inside the target, because the target would control the vulnerability databases. GitLab caches only paths inside the checkout, so its template moves `.crab-cache` to `/tmp/crab-cache` for the scan and back afterwards. GitLab keeps separate caches for protected and unprotected branches by default. Keep that setting so merge requests cannot replace the databases that protected branches use.
+The cache must be outside the scanned directory. CRAB refuses a cache inside the target, because the target would control the vulnerability databases. GitLab caches only paths inside the checkout, so its template moves `.crab-cache` to `/tmp/crab-cache` for the scan and back afterwards, after checking that the folder is neither tracked nor a symlink. Keep GitLab's default of separate caches for protected and unprotected branches.
 
 The results folder is written after the scan. In persistent workspaces, delete an old results folder before scanning or keep it outside the target.
 

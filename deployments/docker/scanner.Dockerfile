@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.7
+# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
 #
 # CRAB scanner image: the crab-risk-scan CLI with the pinned engines from engines.lock.json.
 # Build from the repository root:
@@ -31,10 +31,15 @@ RUN apt-get update \
  && apt-get install --yes --no-install-recommends ca-certificates curl \
  && rm -rf /var/lib/apt/lists/*
 
-# Install CRAB into its own virtual environment from the build context.
-COPY . /src
+# Install CRAB into its own virtual environment: the hash-locked dependencies first, then CRAB itself
+# from the package sources only, without dependency resolution or build isolation.
+COPY deployments/docker/requirements-scanner.txt /tmp/requirements.txt
+COPY pyproject.toml LICENSE README.md /src/
+COPY crab_risk_scan/ /src/crab_risk_scan/
 RUN python -m venv /opt/crab/venv \
- && /opt/crab/venv/bin/pip install "/src[docx]"
+ && /opt/crab/venv/bin/pip install --require-hashes --no-deps -r /tmp/requirements.txt \
+ && /opt/crab/venv/bin/pip install --no-deps --no-build-isolation /src \
+ && rm /tmp/requirements.txt
 ENV PATH=/opt/crab/venv/bin:$PATH
 
 # Pinned engines with SHA-256 verification: binaries in /opt/crab/engines/bin, pip engines in
@@ -88,10 +93,10 @@ COPY --from=build /opt/crab/engines /opt/crab/engines
 COPY --from=build /opt/microsoft/powershell /opt/microsoft/powershell
 COPY --from=build --chown=10001:10001 /opt/crab/cache /opt/crab/cache
 
-# CI runners often start the container with the host user's uid so results stay writable in the
-# checkout. The engine databases therefore stay readable and writable for any uid.
+# The databases belong to uid 10001 and are read-only for other uids. CI templates that run the
+# container under the host uid mount their own cache directory.
 RUN if [ "$INSTALL_PWSH" = "true" ]; then ln -s /opt/microsoft/powershell/pwsh /usr/local/bin/pwsh; fi \
- && chmod -R a+rwX /opt/crab/cache \
+ && chmod 0755 /opt/crab/cache \
  && mkdir -p /work \
  && chown 10001:10001 /work
 

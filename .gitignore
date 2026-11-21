@@ -6,3 +6,7 @@ dist/
 node_modules/
 crab_risk_scan/server/static/
 crab-results/
+.env
+*.env
+/scan/
+.crab-cache/

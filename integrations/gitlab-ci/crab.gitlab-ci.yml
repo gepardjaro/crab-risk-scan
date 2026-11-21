@@ -39,8 +39,24 @@ variables:
 
 crab-scan:
   extends: .crab-base
+  # Only pipelines for protected branches write the cache. Merge request and unprotected pipelines
+  # read it, and the key separates protected from unprotected caches.
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      variables:
+        CRAB_CACHE_POLICY: pull
+    - if: $CI_COMMIT_BRANCH && $CI_COMMIT_REF_PROTECTED == "true"
+      variables:
+        CRAB_CACHE_POLICY: pull-push
+    - if: $CI_COMMIT_BRANCH
+      variables:
+        CRAB_CACHE_POLICY: pull
+    - if: $CI_COMMIT_TAG
+      variables:
+        CRAB_CACHE_POLICY: pull
   cache:
-    key: crab-vulnerability-db
+    key: crab-vulnerability-db-protected-$CI_COMMIT_REF_PROTECTED
+    policy: $CRAB_CACHE_POLICY
     paths:
       - $CRAB_CACHE_DIR
   script:
@@ -52,7 +68,28 @@ crab-scan:
       [ "$CRAB_SBOM" = "true" ] && set -- "$@" --sbom
       [ -n "$CRAB_SERVER_URL" ] && set -- "$@" --server "$CRAB_SERVER_URL" --project "$CRAB_PROJECT"
       rm -rf "$CRAB_WORK_CACHE"
-      if [ -d "$CRAB_CACHE_DIR" ]; then mv "$CRAB_CACHE_DIR" "$CRAB_WORK_CACHE"; else mkdir -p "$CRAB_WORK_CACHE"; fi
+      # A cache committed to the repository or a symlink would let the scanned code supply the
+      # vulnerability databases. Refuse both; fail closed when git cannot answer.
+      if [ -L "$CRAB_CACHE_DIR" ]; then
+        echo "Refusing $CRAB_CACHE_DIR: it is a symlink."
+        exit 1
+      fi
+      if ! tracked="$(git -c safe.directory="$CI_PROJECT_DIR" ls-files -- "$CRAB_CACHE_DIR")"; then
+        echo "Refusing $CRAB_CACHE_DIR: git could not check whether it is tracked."
+        exit 1
+      fi
+      if [ -n "$tracked" ]; then
+        echo "Refusing $CRAB_CACHE_DIR: it is tracked in the repository. Remove it from git."
+        exit 1
+      fi
+      if [ -d "$CRAB_CACHE_DIR" ]; then
+        mv "$CRAB_CACHE_DIR" "$CRAB_WORK_CACHE"
+      elif [ -e "$CRAB_CACHE_DIR" ]; then
+        echo "Refusing $CRAB_CACHE_DIR: it is not a directory."
+        exit 1
+      else
+        mkdir -p "$CRAB_WORK_CACHE"
+      fi
       if [ "$CRAB_UPDATE_DB" = "true" ]; then
         crab-risk-scan db update --cache-dir "$CRAB_WORK_CACHE" "$CRAB_SCAN_PATH" || echo "Database update failed; scanning with the cached databases."
       fi

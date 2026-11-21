@@ -8,7 +8,15 @@
 build
 dist
 tests
-web/node_modules
+**/node_modules
 web/dist
 crab-results
 **/.DS_Store
+# Secrets and local data: compose environment files, the default scan folder and database caches.
+.env
+**/.env
+*.env
+**/*.env
+scan
+.crab-cache
+**/.crab-cache

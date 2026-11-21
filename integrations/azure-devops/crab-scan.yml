@@ -95,26 +95,25 @@ steps:
         case "$CRAB_TOKEN" in '$('*')') CRAB_TOKEN="" ;; esac
         export CRAB_TOKEN
         mkdir -p "$CRAB_RESULTS" "$CRAB_RESULTS/sarif"
-        # Run as the agent user with the sources and results mounted at their host paths, so the
-        # ##vso commands and the uploaded summary reference valid files.
-        docker_args=(--rm --user "$(id -u):$(id -g)" -e HOME=/tmp
-          -v "$BUILD_SOURCESDIRECTORY:$BUILD_SOURCESDIRECTORY" -v "$AGENT_TEMPDIRECTORY:$AGENT_TEMPDIRECTORY"
-          -w "$BUILD_SOURCESDIRECTORY")
+        # Relative cache paths resolve against $(Pipeline.Workspace), outside the scanned sources. Without
+        # cacheDir the job uses its own empty cache: the image's cache belongs to uid 10001.
+        cache="${CRAB_CACHE:-$AGENT_TEMPDIRECTORY/crab-cache}"
+        case "$cache" in /*) ;; *) cache="$PIPELINE_WORKSPACE/$cache" ;; esac
+        mkdir -p "$cache"
+        # Run as the agent user with paths at their host locations, so the ##vso commands and the
+        # uploaded summary reference valid files. The sources are read-only; only the results folder
+        # and the cache are writable.
+        docker_args=(--rm --user "$(id -u):$(id -g)" -e HOME=/tmp --cap-drop ALL --security-opt no-new-privileges
+          -v "$BUILD_SOURCESDIRECTORY:$BUILD_SOURCESDIRECTORY:ro" -v "$CRAB_RESULTS:$CRAB_RESULTS"
+          -v "$cache:$cache" -w "$BUILD_SOURCESDIRECTORY")
         for name in TF_BUILD BUILD_SOURCEVERSION BUILD_SOURCEBRANCH SYSTEM_PULLREQUEST_SOURCEBRANCH \
                     BUILD_REPOSITORY_URI SYSTEM_COLLECTIONURI SYSTEM_TEAMPROJECT BUILD_BUILDID BUILD_SOURCESDIRECTORY; do
           docker_args+=(-e "$name")
         done
         scan_args=(ci "$CRAB_PATH" --output-dir "$CRAB_RESULTS" --engines "$CRAB_ENGINES"
-          --annotations "$CRAB_ANNOTATIONS" --no-fail)
-        if [ -n "$CRAB_CACHE" ]; then
-          # Relative paths resolve against $(Pipeline.Workspace), outside the scanned sources.
-          case "$CRAB_CACHE" in /*) cache="$CRAB_CACHE" ;; *) cache="$PIPELINE_WORKSPACE/$CRAB_CACHE" ;; esac
-          mkdir -p "$cache"
-          docker_args+=(-v "$cache:$cache")
-          scan_args+=(--cache-dir "$cache")
-          if [ "$CRAB_UPDATE_DB" = "True" ]; then
-            docker run "${docker_args[@]}" "$CRAB_IMAGE" db update --cache-dir "$cache" "$CRAB_PATH"
-          fi
+          --annotations "$CRAB_ANNOTATIONS" --no-fail --cache-dir "$cache")
+        if [ "$CRAB_UPDATE_DB" = "True" ]; then
+          docker run "${docker_args[@]}" "$CRAB_IMAGE" db update --cache-dir "$cache" "$CRAB_PATH"
         fi
         [ -n "$CRAB_POLICY" ] && scan_args+=(--policy "$CRAB_POLICY")
         [ -n "$CRAB_EXCEPTIONS" ] && scan_args+=(--exceptions "$CRAB_EXCEPTIONS")
@@ -170,6 +169,6 @@ steps:
             [ -n "$CRAB_POLICY" ] && gate_args+=(--policy "$CRAB_POLICY")
             [ -n "$CRAB_EXCEPTIONS" ] && gate_args+=(--exceptions "$CRAB_EXCEPTIONS")
             [ -n "$CRAB_FAIL_ON" ] && gate_args+=(--fail-on "$CRAB_FAIL_ON")
-            docker run --rm --network none --user "$(id -u):$(id -g)" -e HOME=/tmp \
-              -v "$BUILD_SOURCESDIRECTORY:$BUILD_SOURCESDIRECTORY" -v "$AGENT_TEMPDIRECTORY:$AGENT_TEMPDIRECTORY" \
+            docker run --rm --network none --user "$(id -u):$(id -g)" -e HOME=/tmp --cap-drop ALL --security-opt no-new-privileges \
+              -v "$BUILD_SOURCESDIRECTORY:$BUILD_SOURCESDIRECTORY:ro" -v "$CRAB_RESULTS:$CRAB_RESULTS:ro" \
               -w "$BUILD_SOURCESDIRECTORY" "$CRAB_IMAGE" "${gate_args[@]}"

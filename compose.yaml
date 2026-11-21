@@ -24,6 +24,12 @@ services:
       CRAB_ADMIN_USERNAME: ${CRAB_ADMIN_USERNAME:-admin}
       CRAB_ADMIN_PASSWORD: ${CRAB_ADMIN_PASSWORD:-}
       CRAB_SESSION_HOURS: ${CRAB_SESSION_HOURS:-12}
+      # Comma-separated host or host:port allowed for git sources. Empty rejects git sources.
+      CRAB_GIT_HOSTS: ${CRAB_GIT_HOSTS:-}
+      # Failed logins per client address in a lockout window. 0 disables the per-client limit.
+      CRAB_LOGIN_MAX_FAILURES_PER_CLIENT: ${CRAB_LOGIN_MAX_FAILURES_PER_CLIENT:-100}
+      # Behind a reverse proxy, also trust it, for example with FORWARDED_ALLOW_IPS=<proxy address>;
+      # otherwise all clients share one login bucket.
     ports:
       - "${CRAB_BIND:-127.0.0.1}:${CRAB_PORT:-8080}:8080"
     volumes:
@@ -51,6 +57,8 @@ services:
     command: ["worker", "--server", "http://api:8080", "--scan-root", "/scan"]
     environment:
       CRAB_WORKER_TOKEN: ${CRAB_WORKER_TOKEN:-}
+      # Workers allow the same git hosts by default (worker --git-host).
+      CRAB_GIT_HOSTS: ${CRAB_GIT_HOSTS:-}
     volumes:
       - ${CRAB_SCAN_DIR:-./scan}:/scan:ro
       - crab-cache:/opt/crab/cache
@@ -69,7 +77,7 @@ services:
       replicas: ${CRAB_WORKERS:-1}
 
   db:
-    image: postgres:17-alpine
+    image: postgres:17-alpine@sha256:526f86d93c6ea08fd3f1fe5605650cacc781b2c6013169a0ad8f42c7d3d84f32
     profiles: ["postgres"]
     restart: unless-stopped
     environment:
