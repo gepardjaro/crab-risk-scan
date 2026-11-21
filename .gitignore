@@ -3,3 +3,6 @@ __pycache__/
 build/
 dist/
 .venv/
+node_modules/
+crab_risk_scan/server/static/
+crab-results/
