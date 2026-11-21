@@ -78,4 +78,6 @@ class InfrastructureTests(unittest.TestCase):
             self.assertTrue(spdx["spdxVersion"].startswith("SPDX-"))
             cdx = json.loads((out / "dir" / "sbom.cdx.json").read_text(encoding="utf-8"))
             self.assertEqual(cdx["bomFormat"], "CycloneDX")
-            self.assertNotIn(str(root.parent), json.dumps(cdx))
+            serialized = json.dumps(cdx) + json.dumps(spdx)
+            for form in {str(root.parent), root.parent.as_posix(), json.dumps(str(root.parent))[1:-1]}:
+                self.assertNotIn(form, serialized)

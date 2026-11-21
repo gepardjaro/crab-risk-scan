@@ -31,6 +31,31 @@ def _validate(fmt, document):
     return document
 
 
+def relativize(value, target):
+    """Replace the scanned directory's absolute path with "/" in every string.
+
+    Syft names file components by their absolute host path. Afterwards they match the
+    source-relative `syft:location` values and the host layout stays out of the inventory.
+    """
+    prefixes = sorted({str(target), Path(target).as_posix()}, key=len, reverse=True)
+
+    def clean(item):
+        if isinstance(item, str):
+            for prefix in prefixes:
+                if item == prefix:
+                    return "/"
+                for separator in ("/", "\\"):
+                    item = item.replace(prefix + separator, "/")
+            return item
+        if isinstance(item, list):
+            return [clean(entry) for entry in item]
+        if isinstance(item, dict):
+            return {key: clean(entry) for key, entry in item.items()}
+        return item
+
+    return clean(value)
+
+
 def generate(directory, executable=None, formats=("cyclonedx-json",), *, timeout=900, revision=None):
     """Return {format: document} for every requested format from a single Syft run."""
     formats = sorted(set(formats))
@@ -68,7 +93,7 @@ def generate(directory, executable=None, formats=("cyclonedx-json",), *, timeout
             if len(data) > LIMIT:
                 raise SbomError("sbom_size_limit", "SBOM exceeds the 32 MiB output limit")
             try:
-                documents[fmt] = _validate(fmt, json.loads(data))
+                documents[fmt] = relativize(_validate(fmt, json.loads(data)), target)
             except (ValueError, RecursionError):
                 raise SbomError("sbom_invalid", f"Syft returned an invalid {fmt} document") from None
         return documents

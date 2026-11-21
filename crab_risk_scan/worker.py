@@ -93,10 +93,11 @@ class Heartbeat(threading.Thread):
         self.stream = stream
         self.cancelled = threading.Event()
         self.lost = False
-        self._stop = threading.Event()
+        # Not `_stop`: threading.Thread defines a private _stop() method before Python 3.13.
+        self._halt = threading.Event()
 
     def run(self):
-        while not self._stop.wait(self.interval):
+        while not self._halt.wait(self.interval):
             try:
                 _, body = self.client.request("POST", f"/jobs/{self.job_id}/heartbeat", {"worker": self.worker})
             except ServerError as exc:
@@ -115,7 +116,7 @@ class Heartbeat(threading.Thread):
             self.interval = max(1.0, float(body.get("lease_seconds") or 30) / 3)
 
     def stop(self):
-        self._stop.set()
+        self._halt.set()
         if self.is_alive():
             self.join(timeout=5)
 

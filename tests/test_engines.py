@@ -427,3 +427,22 @@ class CacheTests(unittest.TestCase):
         with mock.patch.dict(os.environ):
             os.environ.pop("CRAB_CACHE_DIR", None)
             self.assertEqual(engines.default_cache_dir().name, "crab-risk-scan")
+
+
+class SbomPathTests(unittest.TestCase):
+    def test_absolute_target_paths_become_source_relative(self):
+        from crab_risk_scan.sbom import relativize
+        for target, separator in ((Path("/home/runner/work/repo"), "/"),
+                                  (Path("C:/Users/runner/AppData/Local/Temp/repo"), "\\")):
+            native = str(target)
+            document = {"metadata": {"component": {"name": "repo"}}, "components": [
+                {"type": "file", "name": native + separator + "package-lock.json"},
+                {"type": "file", "name": target.as_posix() + "/web/package.json"},
+                {"type": "library", "name": "left-pad", "properties": [{"name": "syft:location:0:path",
+                                                                       "value": "/package-lock.json"}]},
+                {"type": "file", "name": native}]}
+            cleaned = relativize(document, target)
+            self.assertEqual([c["name"] for c in cleaned["components"]],
+                             ["/package-lock.json", "/web/package.json", "left-pad", "/"])
+            self.assertNotIn(target.as_posix(), json.dumps(cleaned))
+            self.assertNotIn(json.dumps(native)[1:-1], json.dumps(cleaned))

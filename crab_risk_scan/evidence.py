@@ -56,7 +56,9 @@ def relative_path(value, root=None):
     if ".." in PurePosixPath(value.replace("\\", "/")).parts:
         raise ValueError("parent traversal")
     if root is not None and Path(value).is_absolute():
-        value = Path(value).relative_to(Path(root).resolve()).as_posix()
+        # Resolve both sides: temporary folders are often reached through a symlink (macOS /var)
+        # or an 8.3 short name (Windows), and producers report whichever form they were given.
+        value = Path(value).resolve().relative_to(Path(root).resolve()).as_posix()
     path = PurePosixPath(value.replace("\\", "/"))
     if not path.parts or path.is_absolute() or PureWindowsPath(value).drive or ":" in str(path):
         raise ValueError("invalid path")
