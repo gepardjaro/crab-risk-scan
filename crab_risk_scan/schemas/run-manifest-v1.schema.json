@@ -11,7 +11,7 @@
     "reports": {"type": "array", "items": {"$ref": "#/$defs/report"}}
   },
   "$defs": {
-    "identifier": {"type": "string", "pattern": "^[\\w@.+:/~^!-]{1,256}$"},
+    "identifier": {"type": "string", "pattern": "^[\\w@.+:/~^!-]{1,256}(?!\\n)$"},
     "report": {
       "type": "object",
       "additionalProperties": false,

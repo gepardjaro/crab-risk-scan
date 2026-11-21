@@ -59,7 +59,7 @@ Policy files can override a rule's severity with `rules.severity`, for example `
 | Bandit | `test_id`, severity, confidence, line range, byte offsets, `issue_cwe.id` as `cwe`, `more_info` as `help_uri` |
 | Opengrep | `check_id`, severity, line and column span, `extra.metadata.cwe` normalized to `CWE-n`, the first http(s) URL in `metadata.references`, `source` or `shortlink` as `help_uri`. Rules whose ID starts with `crab-` are `kind: review`. |
 | Gitleaks | Rule ID, file, line and column span. Secret, match, fingerprint and commit metadata are discarded. |
-| Checkov | Check ID, severity, framework, resource, line range, `guideline` as `help_uri` |
+| Checkov | Check ID, severity, framework, resource, line range, `guideline` as `help_uri`. Results of the `secrets` framework become `secrets` findings (module Sniffer, severity high when Checkov gives none). Their resource is dropped, because Checkov sets it to the SHA-1 of the secret. |
 | ShellCheck | Code, level, span, `https://www.shellcheck.net/wiki/SC<code>` as `help_uri` |
 | PSScriptAnalyzer | Rule name, severity, extent, the Microsoft Learn rule page for built-in `PS*` rules as `help_uri` |
 | Trivy | Advisory, package, package URL, `CweIDs`, `CVSS` (the `nvd` V3 score and vector, else another vendor with a numeric score), the first `FixedVersion`, `PrimaryURL` as `help_uri` |
@@ -67,6 +67,6 @@ Policy files can override a rule's severity with `rules.severity`, for example `
 
 `help_uri` values must use http or https, contain no whitespace or control characters and be at most 2048 characters. Other values are dropped. Built-in rules carry their CWE: CRAB-PY-001 CWE-295, CRAB-CTR-001 CWE-250, CRAB-HTML-001 CWE-319 and CRAB-SQL-001 CWE-732.
 
-Source fingerprints hash the producer, rule, path, the whitespace-normalized text of the flagged lines, an occurrence index and a stable identity such as the Checkov resource, so inserted lines elsewhere keep fingerprints and exceptions. Secret fingerprints leave out the content hash. Dependency fingerprints are unchanged.
+Source fingerprints hash the producer, rule, path, the whitespace-normalized text of the flagged lines, an occurrence index and a stable identity such as the Checkov resource, so inserted lines elsewhere keep fingerprints and exceptions. Credential findings (every `secrets` finding and the Bandit hard-coded password rules B105, B106 and B107) carry only the first 16 bits of that hash. A changed secret value therefore gets a new fingerprint, so an exception for a placeholder never covers a real key, while 16 bits are too few to confirm a guessed secret. When the file cannot be read, the credential fingerprint has no change tag. Dependency fingerprints are unchanged.
 
 [Fixture and integration tests](../tests/) · [Producer formats, parsing dependencies and examples](integrations.md) · [Gap analysis](gap-analysis.md) · [SARIF specification](https://docs.oasis-open.org/sarif/sarif/v2.1.0/sarif-v2.1.0.html)

@@ -66,7 +66,7 @@ def build_rules(report):
             "shortDescription": {"text": first["message"]},
             "fullDescription": {"text": first["message"]},
             "help": {"text": f"{guidance} Reference: {uri}",
-                     "markdown": f"{guidance}\n\n[Reference]({uri})"},
+                     "markdown": f"{guidance}\n\n[Reference]({summary.markdown_url(uri)})"},
             "helpUri": uri,
             "defaultConfiguration": {"level": LEVELS[severity]},
             "properties": {

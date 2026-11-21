@@ -7,9 +7,11 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 import jsonschema
 
+from crab_risk_scan import adapters, evidence
 from crab_risk_scan.reporting import collect
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -310,3 +312,101 @@ class ReportTests(unittest.TestCase):
             self.assertEqual(bom["bomFormat"], "CycloneDX")
             self.assertIn(("crab-demo-leaf", "1.0.0"),
                           [(pkg["name"], pkg.get("version")) for pkg in bom["components"]])
+
+
+class NetworkPathTests(unittest.TestCase):
+    """Report-supplied paths are checked lexically and never resolved or opened (F1)."""
+
+    UNC = "\\\\attacker.example\\share\\client.py"
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name) / "repo"
+        self.root.mkdir()
+        (self.root / "client.py").write_text("import ssl\n", encoding="utf-8")
+        original_resolve, original_realpath = Path.resolve, os.path.realpath
+
+        def guarded(name, original):
+            def call(target, *args, **kwargs):
+                text = str(target).replace("\\", "/")
+                if text.startswith("//") or "attacker" in text:
+                    raise AssertionError(f"{name} touched {target!r}")
+                return original(target, *args, **kwargs)
+            return call
+
+        for patcher in (mock.patch.object(Path, "resolve", guarded("Path.resolve", original_resolve)),
+                        mock.patch("os.path.realpath", guarded("os.path.realpath", original_realpath))):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_relative_path_rejects_network_and_device_paths(self):
+        for value in (self.UNC, "//attacker.example/share/x.py", "\\\\?\\C:\\repo\\x.py", "\\\\.\\pipe\\x",
+                      "\\\\?\\UNC\\attacker.example\\share\\x.py"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                evidence.relative_path(value, self.root)
+        self.assertEqual(evidence.relative_path(str(self.root / "client.py"), self.root), "client.py")
+        with self.assertRaises(ValueError):
+            evidence.relative_path(str(self.root.parent / "other.py"), self.root)
+
+    def test_bandit_and_checkov_paths_are_checked_lexically(self):
+        row = {"test_id": "B323", "filename": self.UNC, "line_number": 1, "issue_severity": "MEDIUM",
+               "issue_confidence": "HIGH"}
+        with self.assertRaises(ValueError):
+            adapters.bandit({"results": [row], "errors": []}, self.root)
+        check = {"check_id": "CKV_DEMO_1", "file_path": "/client.py", "file_abs_path": self.UNC,
+                 "resource": "aws.demo", "file_line_range": [1, 1]}
+        result = adapters.checkov({"check_type": "terraform", "results": {"failed_checks": [check]}}, self.root)
+        self.assertEqual([hit["path"] for hit in result.findings], ["client.py"])
+
+    def test_sarif_network_uris_are_skipped(self):
+        absolute_base = self.root.as_uri() + "/"
+        uris = [("file:////attacker.example/share/client.py", None),
+                ("%2F%2Fattacker.example/share/client.py", None),
+                ("\\\\attacker.example\\share\\client.py", "SRC"),
+                ("client.py", "REMOTE")]
+        results = [{"ruleId": "R1", "level": "error", "message": {"text": "x"},
+                    "locations": [{"physicalLocation": {"artifactLocation": dict(
+                        {"uri": uri}, **({"uriBaseId": base} if base else {})),
+                        "region": {"startLine": 1}}}]} for uri, base in uris]
+        doc = {"version": "2.1.0", "runs": [{"tool": {"driver": {"name": "demo", "rules": [{"id": "R1"}]}},
+                                             "originalUriBaseIds": {"SRC": {"uri": absolute_base},
+                                                                    "REMOTE": {"uri": "file:////attacker.example/s/"}},
+                                             "results": results}]}
+        self.assertEqual(adapters.sarif(doc, self.root).findings, [])
+
+    @unittest.skipUnless(sys.platform == "win32", "8.3 short names exist only on Windows")
+    def test_windows_short_name_root_matches_long_name_paths(self):
+        import ctypes
+        buffer = ctypes.create_unicode_buffer(1024)
+        if not ctypes.windll.kernel32.GetShortPathNameW(str(self.root), buffer, 1024) or \
+                buffer.value.upper() == str(self.root).upper():
+            self.skipTest("8.3 short names are disabled on this volume")
+        short = Path(buffer.value)
+        self.assertEqual(evidence.relative_path(str(self.root / "client.py"), short), "client.py")
+        self.assertEqual(evidence.relative_path(str(short / "client.py"), short), "client.py")
+
+
+class StrictInputTests(unittest.TestCase):
+    """Regression (security review F5): NaN and trailing newlines passed schema validation."""
+
+    def test_report_schema_rejects_trailing_newlines(self):
+        report = json.loads((ROOT / "tests/fixtures/report-v3.json").read_text(encoding="utf-8"))
+        validate(report)
+        for mutate in (lambda r: r["findings"][0].update(rule=r["findings"][0]["rule"] + "\n"),
+                       lambda r: r["findings"][0].update(fingerprint=r["findings"][0]["fingerprint"] + "\n"),
+                       lambda r: r.update(repository="https://github.com/example/demo-service\n"),
+                       lambda r: next(f for f in r["findings"] if f.get("exception", {}).get("expires"))
+                       ["exception"].update(expires="2027-03-31\n")):
+            broken = json.loads(json.dumps(report))
+            mutate(broken)
+            with self.subTest(mutate=mutate), self.assertRaises(jsonschema.ValidationError):
+                validate(broken)
+
+    def test_json_inputs_reject_nan_and_infinity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for constant in ("NaN", "Infinity", "-Infinity"):
+                path = Path(tmp) / "doc.json"
+                path.write_text('{"cvss": {"score": %s}}' % constant, encoding="utf-8")
+                with self.subTest(constant=constant), self.assertRaises(ValueError):
+                    evidence.load_json(path)

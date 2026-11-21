@@ -38,10 +38,8 @@ def table(headers, rows):
 
 
 def link(text, uri):
-    if uri and uri.startswith(("https://", "http://")):
-        safe = uri.replace("(", "%28").replace(")", "%29").replace(" ", "%20").replace("<", "%3C").replace(">", "%3E")
-        return f"[{esc(text)}]({safe})"
-    return esc(text)
+    safe = summary.markdown_url(uri)
+    return f"[{esc(text)}]({safe})" if safe else esc(text)
 
 
 def metadata_lines(model):

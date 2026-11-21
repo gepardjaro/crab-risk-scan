@@ -348,6 +348,10 @@ def upload(server, project, token, report, sbom=None, *, platform=None, timeout=
     if base is None or urllib.parse.urlsplit(server).username is not None:
         result["reason"] = "invalid_server_url"
         return result
+    if base_is_insecure(base):
+        # The bearer token must never cross a network unencrypted; loopback is the only exception.
+        result["reason"] = "insecure_server_url"
+        return result
     if not project or len(project) > 200 or CONTROL.search(project):
         result["reason"] = "invalid_project"
         return result
@@ -486,8 +490,6 @@ def finish(result, *, directory, output_dir, platform, extra_formats=(), extra_o
                 exit_code = 2
             else:
                 _warn(platform, plain(message), stdout, stderr)
-        elif base_is_insecure(upload_result["server"]):
-            _warn(platform, "the bearer token was sent over unencrypted HTTP", stdout, stderr)
 
     policy = report.get("policy", {})
     run = {
@@ -662,6 +664,8 @@ def run_ci(args):
         parser.error("--require-upload requires --server")
     if args.server and (safe_url(args.server) is None or urllib.parse.urlsplit(args.server).username is not None):
         parser.error("--server expects an http(s) URL without credentials")
+    if args.server and base_is_insecure(safe_url(args.server)):
+        parser.error("--server must use https unless it is a loopback address: the token would be sent unencrypted")
     if args.template is not None and args.template not in ("technical", "executive"):
         template = Path(args.template)
         if template.suffix.lower() != ".docx" or not template.is_file():

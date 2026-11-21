@@ -15,11 +15,11 @@
       "additionalProperties": false,
       "required": ["fingerprint", "status", "reason", "reviewer"],
       "properties": {
-        "fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}(?!\\n)$"},
         "status": {"enum": ["accepted", "false_positive", "not_affected"]},
         "reason": {"type": "string", "minLength": 1, "maxLength": 2000, "pattern": "\\S"},
         "reviewer": {"type": "string", "minLength": 1, "maxLength": 256, "pattern": "\\S"},
-        "expires": {"anyOf": [{"type": "string", "format": "date", "pattern": "^\\d{4}-\\d{2}-\\d{2}$"},
+        "expires": {"anyOf": [{"type": "string", "format": "date", "pattern": "^\\d{4}-\\d{2}-\\d{2}(?!\\n)$"},
                               {"type": "null"}]},
         "ticket": {"anyOf": [{"type": "string", "minLength": 1, "maxLength": 256, "pattern": "\\S"},
                              {"type": "null"}]},

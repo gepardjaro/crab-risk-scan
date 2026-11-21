@@ -13,6 +13,13 @@ from . import summary
 
 MARKER = "{{CRAB_REPORT}}"
 TEMPLATE_LIMIT = 25 * 1024 * 1024
+TEMPLATE_EXPANDED_LIMIT = 100 * 1024 * 1024
+TEMPLATE_ENTRY_LIMIT = 2000
+# Parts that run code or embed foreign objects when the document is opened.
+ACTIVE_PARTS = re.compile(r"vbaProject|vbaData|activeX|oleObject|/embeddings/", re.IGNORECASE)
+RELATIONSHIP = re.compile(rb"<(?:\w+:)?Relationship\b[^>]*>")
+EXTERNAL_TARGET = re.compile(rb"""\bTargetMode\s*=\s*["']External["']""")
+HYPERLINK_TYPE = re.compile(rb"""\bType\s*=\s*["'][^"']*/relationships/hyperlink["']""")
 DETAIL_LIMIT = 200
 EXECUTIVE_TOP = 10
 SUMMARY_TOP = 5
@@ -437,6 +444,31 @@ def find_marker(document, qn):
     return None
 
 
+def check_template(path):
+    """Refuse templates that expand too far or pull external content into generated reports.
+
+    External hyperlinks are kept: they need a click. External templates, frames, images and
+    other external parts load on open, which turns a report into a beacon or, with a UNC target,
+    an NTLM credential leak.
+    """
+    try:
+        archive = zipfile.ZipFile(path)
+    except (zipfile.BadZipFile, OSError) as error:
+        raise ValueError(f"DOCX template could not be opened: {path.name}") from error
+    with archive:
+        entries = archive.infolist()
+        if len(entries) > TEMPLATE_ENTRY_LIMIT or sum(entry.file_size for entry in entries) > TEMPLATE_EXPANDED_LIMIT:
+            raise ValueError(f"DOCX template expands beyond {TEMPLATE_EXPANDED_LIMIT // (1024 * 1024)} MiB "
+                             f"or {TEMPLATE_ENTRY_LIMIT} parts: {path.name}")
+        for entry in entries:
+            if ACTIVE_PARTS.search(entry.filename):
+                raise ValueError(f"DOCX template contains macros or embedded objects: {path.name}")
+            if entry.filename.lower().endswith(".rels"):
+                for relationship in RELATIONSHIP.findall(archive.read(entry)):
+                    if EXTERNAL_TARGET.search(relationship) and not HYPERLINK_TYPE.search(relationship):
+                        raise ValueError(f"DOCX template references external content: {path.name}")
+
+
 def open_template(docx, template):
     path = Path(template)
     if path.suffix.lower() != ".docx":
@@ -445,6 +477,7 @@ def open_template(docx, template):
         raise ValueError(f"DOCX template not found: {path.name}")
     if path.stat().st_size > TEMPLATE_LIMIT:
         raise ValueError(f"DOCX template exceeds {TEMPLATE_LIMIT // (1024 * 1024)} MiB: {path.name}")
+    check_template(path)
     try:
         return docx.Document(str(path))
     except Exception as error:  # python-docx raises several unrelated types for damaged packages

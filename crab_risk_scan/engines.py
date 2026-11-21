@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import urllib.request
 import zipfile
 from dataclasses import dataclass, field
@@ -380,7 +381,7 @@ def rule_pack_suffixes(path=RULE_PACK):
     return suffixes
 
 
-def checkov_frameworks(files):
+def checkov_frameworks(files, *, online=False):
     frameworks = []
     if files.has_suffix(".tf") or any(p.endswith(".tf.json") for p in files.paths):
         frameworks.append("terraform")
@@ -388,7 +389,9 @@ def checkov_frameworks(files):
         frameworks.append("bicep")
     if "Dockerfile" in files.names:
         frameworks.append("dockerfile")
-    if "Chart.yaml" in files.names:
+    if online and "Chart.yaml" in files.names:
+        # Checkov renders charts with `helm template --dependency-update`, which downloads chart
+        # dependencies from repositories the chart names and writes them into the target.
         frameworks.append("helm")
     if any(re.match(r"\.github/workflows/[^/]+\.ya?ml$", p) for p in files.paths):
         frameworks.append("github_actions")
@@ -476,8 +479,8 @@ def build_checkov(ctx):
     config = ctx.work.cwd / "checkov.yaml"
     config.write_text("{}\n", encoding="utf-8")
     return [Command([str(ctx.executable), f"--directory={ctx.target}", "--config-file", str(config),
-                     "--framework", *checkov_frameworks(ctx.files), "--output", "json", "--quiet", "--compact",
-                     "--soft-fail", "--skip-download", "--skip-results-upload",
+                     "--framework", *checkov_frameworks(ctx.files, online=not ctx.offline), "--output", "json",
+                     "--quiet", "--compact", "--soft-fail", "--skip-download", "--skip-results-upload",
                      "--download-external-modules", "false"], stdout=ctx.report)]
 
 
@@ -579,7 +582,7 @@ REGISTRY = {
     "gitleaks": Engine("gitleaks", "gitleaks", "gitleaks", "gitleaks-default", build_gitleaks, exit_gitleaks,
                        lambda files, options: bool(files.paths)),
     "checkov": Engine("checkov", "checkov", "checkov", "checkov-default", build_checkov, exit_zero,
-                      lambda files, options: bool(checkov_frameworks(files))),
+                      lambda files, options: bool(checkov_frameworks(files, online=not options.offline))),
     "shellcheck": Engine("shellcheck", "shellcheck", "shellcheck", "shellcheck-default", build_shellcheck,
                          exit_shellcheck, lambda files, options: bool(_shellcheck_files(files))),
     "psscriptanalyzer": Engine("psscriptanalyzer", "psscriptanalyzer", "psscriptanalyzer", "crab-pssa-v1",
@@ -679,14 +682,18 @@ def _normalize_checkov(ctx):
 
 
 def run_engine(engine, ctx, timeout):
-    """Run one engine. Returns (status, reason)."""
+    """Run one engine. Returns (status, reason). `timeout` bounds all of the engine's commands together."""
     commands = engine.build(ctx)
     env = engine.env(ctx) if engine.env else None
+    deadline = time.monotonic() + timeout
     statuses = []
     for command in commands:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return "failed", "timeout"
         try:
-            outcome = run_isolated(command.argv, ctx.work, timeout=timeout, target=ctx.target, env=env,
-                                   stdout=command.stdout, online=not ctx.offline)
+            outcome = run_isolated(command.argv, ctx.work, timeout=max(1, int(remaining)), target=ctx.target,
+                                   env=env, stdout=command.stdout, online=not ctx.offline)
         except OSError:
             return "failed", "launch_failed"
         if outcome.timed_out:
@@ -910,15 +917,28 @@ def _install_module(tool, entry, asset, dest, opener):
     return folder
 
 
+def pip_requirements(entry):
+    """The packaged hash-locked requirement set for a pip engine. Every pin carries SHA-256 hashes."""
+    path = Path(__file__).with_name("engines") / entry["requirements"]
+    if path.parent != Path(__file__).with_name("engines") or not path.is_file():
+        raise ValueError(f"missing requirement lock for {entry['package']}")
+    return path
+
+
 def _install_pip(tool, entry, dest):
+    requirements = pip_requirements(entry)
     venv = dest / "venvs" / tool
     if venv.exists():
         shutil.rmtree(venv)
-    subprocess.run([sys.executable, "-m", "venv", str(venv)], check=True, stdin=subprocess.DEVNULL)
+    # -I and a private working directory keep a checkout in the current directory off sys.path,
+    # so its venv/, pip/ or ensurepip/ folders cannot replace the standard modules.
+    subprocess.run([sys.executable, "-I", "-m", "venv", str(venv)], check=True, stdin=subprocess.DEVNULL, cwd=dest)
     scripts = venv / ("Scripts" if os.name == "nt" else "bin")
     python = scripts / ("python.exe" if os.name == "nt" else "python")
-    subprocess.run([str(python), "-m", "pip", "install", "--quiet", "--disable-pip-version-check", "--no-input",
-                    entry["package"]], check=True, stdin=subprocess.DEVNULL)
+    # Hash-locked wheels only: a compromised index or transitive release cannot change what runs.
+    subprocess.run([str(python), "-I", "-m", "pip", "install", "--quiet", "--disable-pip-version-check", "--no-input",
+                    "--require-hashes", "--no-deps", "--only-binary", ":all:", "-r", str(requirements)],
+                   check=True, stdin=subprocess.DEVNULL, cwd=dest)
     shim = dest / "bin" / executable_name(tool)
     shim.parent.mkdir(parents=True, exist_ok=True)
     if os.name == "nt":

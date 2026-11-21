@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import tempfile
@@ -5,7 +6,7 @@ import unittest
 from pathlib import Path
 
 from crab_risk_scan.adapters import checkov, gitleaks, sarif
-from crab_risk_scan.evidence import assign_fingerprints, purl_key
+from crab_risk_scan.evidence import assign_fingerprints, fingerprint, purl_key
 from test_reports import cli, validate
 
 
@@ -134,19 +135,58 @@ class ArchitectureTests(unittest.TestCase):
                          ("critical", "unknown", "secrets"))
         self.assertEqual(doc["policy"]["violations"], [{"gate": "severity", "count": 1}])
 
-    def test_secret_fingerprints_do_not_depend_on_line_content(self):
+    def test_credential_fingerprints_follow_the_value_with_a_16_bit_tag(self):
         rows = [{"producer": "gitleaks", "rule": "generic-api-key", "path": "a.env", "line": 1, "end_line": 1,
                  "category": "secrets"}]
-        (self.root / "a.env").write_text("KEY=one\n")
+        (self.root / "a.env").write_text("KEY=placeholder-0001\n")
         first = assign_fingerprints([dict(r) for r in rows], self.root)[0]["fingerprint"]
-        (self.root / "a.env").write_text("# moved\nKEY=two\n")
+        (self.root / "a.env").write_text("# moved\nKEY=placeholder-0001\n")
         moved = assign_fingerprints([dict(rows[0], line=2, end_line=2)], self.root)[0]["fingerprint"]
         self.assertEqual(first, moved)
+        # Regression (security review F2): a real key swapped in at the same position used to keep the
+        # placeholder's fingerprint, so its exception silently suppressed the real key.
+        (self.root / "a.env").write_text("# moved\nKEY=real-key-value-0002\n")
+        swapped = assign_fingerprints([dict(rows[0], line=2, end_line=2)], self.root)[0]["fingerprint"]
+        self.assertNotEqual(first, swapped)
+        # Only 16 bits of the line hash enter the fingerprint, so it cannot confirm a guessed value.
+        line_hash = hashlib.sha256(b"KEY=real-key-value-0002").hexdigest()
+        self.assertEqual(swapped, fingerprint(["gitleaks", "generic-api-key", "a.env", line_hash[:4], 0]))
+        # Hard-coded password rules use the credential scheme too (security review F4).
+        (self.root / "b.py").write_text('password = "Summer2026!"\n')
+        b105 = assign_fingerprints([{"producer": "bandit", "rule": "B105", "path": "b.py", "line": 1,
+                                     "end_line": 1, "category": "sast"}], self.root)[0]["fingerprint"]
+        tag = hashlib.sha256(b'password = "Summer2026!"').hexdigest()[:4]
+        self.assertEqual(b105, fingerprint(["bandit", "B105", "b.py", tag, 0]))
         source = [{"producer": "bandit", "rule": "B1", "path": "a.py", "line": 1, "end_line": 1}]
         (self.root / "a.py").write_bytes(b"x = 1\r\n")
         crlf = assign_fingerprints([dict(r) for r in source], self.root)[0]["fingerprint"]
         (self.root / "a.py").write_bytes(b"x  =  1\n")
         self.assertEqual(crlf, assign_fingerprints([dict(r) for r in source], self.root)[0]["fingerprint"])
+
+    def test_exception_for_a_placeholder_does_not_cover_a_swapped_secret(self):
+        leaks = self.save("leaks.json", [{"RuleID": "generic-api-key", "File": "app.env", "StartLine": 1,
+                                          "EndLine": 1, "StartColumn": 5, "EndColumn": 24}])
+        (self.root / "app.env").write_text("KEY=placeholder-value-01\n")
+        hit, = self.collect(1, "--gitleaks", leaks)["findings"]
+        exceptions = self.save("exceptions.json", {"version": 2, "exceptions": [
+            {"fingerprint": hit["fingerprint"], "status": "false_positive", "reason": "Test placeholder",
+             "reviewer": "dev-lead"}]})
+        self.assertEqual(self.collect(0, "--gitleaks", leaks, "--exceptions", exceptions)["policy"]["suppressed"], 1)
+        (self.root / "app.env").write_text("KEY=SYNTHETIC_CANARY_REAL\n")
+        doc = self.collect(1, "--gitleaks", leaks, "--exceptions", exceptions)
+        self.assertFalse(doc["findings"][0]["suppressed"])
+        self.assertEqual(doc["policy"]["stale_exceptions"], [hit["fingerprint"]])
+
+    def test_checkov_secret_results_drop_the_secret_hash(self):
+        secret_hash = "25910f981e85ca04baf359199dd0bd4a3ae738b6"
+        (self.root / "config.py").write_text("token = 'value'\n")
+        row = {"check_id": "CKV_SECRET_6", "file_path": "/config.py", "repo_file_path": "/config.py",
+               "resource": secret_hash, "file_line_range": [1, 1]}
+        out = checkov({"check_type": "secrets", "results": {"failed_checks": [row]}}, self.root)
+        hit, = out.findings
+        self.assertEqual((hit["category"], hit["module"], hit["severity"]), ("secrets", "Sniffer", "high"))
+        self.assertNotIn("resource", hit)
+        self.assertNotIn(secret_hash, json.dumps(hit))
 
     def test_checkov_virtual_root_on_windows_and_posix(self):
         rows = [{"check_id": "CKV_AWS_24", "file_path": virtual, "repo_file_path": "/crab-synth/infra/main.tf",

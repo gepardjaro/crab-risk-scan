@@ -6,6 +6,19 @@ report: titles and locations are built from structured fields only.
 import datetime as dt
 from urllib.parse import quote
 
+# Characters kept as they are in a URL placed inside Markdown. Everything else, including
+# ( ) [ ] < > | \ ` " ' and spaces, is percent-encoded so a crafted URL cannot close the link,
+# start an image, add a title or split a table cell. Existing %XX escapes stay intact.
+MARKDOWN_URL_SAFE = ":/?#@!$&*+,;=%-._~"
+
+
+def markdown_url(uri):
+    """An http(s) URL encoded for a Markdown link destination, or None for other schemes."""
+    if not isinstance(uri, str) or not uri.startswith(("https://", "http://")):
+        return None
+    return quote(uri, safe=MARKDOWN_URL_SAFE)
+
+
 SEVERITIES = ("critical", "high", "medium", "low", "info", "unknown")
 CATEGORIES = ("sast", "secrets", "iac", "sca", "container")
 KINDS = ("vulnerability", "review")

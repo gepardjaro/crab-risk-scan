@@ -10,6 +10,7 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import jsonschema
 
@@ -437,6 +438,12 @@ class Upload(Publishing):
         self.assertEqual(runner.upload("https://example.com", "p\n", TOKEN, {})["reason"], "invalid_project")
         self.assertEqual(runner.upload("https://example.com", "p", "a\nb", {})["reason"], "invalid_token")
 
+    def test_plain_http_to_a_remote_server_sends_nothing(self):
+        # Regression (security review F20): the token went out over plain HTTP and only a warning followed.
+        with mock.patch("urllib.request.OpenerDirector.open", side_effect=AssertionError("request sent")):
+            result = runner.upload("http://crab.example.com", "demo-service", TOKEN, {})
+        self.assertEqual(result["reason"], "insecure_server_url")
+
 
 class CommandLine(unittest.TestCase):
     def run_ci(self, *args, environ=None):
@@ -455,6 +462,10 @@ class CommandLine(unittest.TestCase):
         self.assertEqual(self.run_ci("examples/demo", "--server", "https://crab.example.com").returncode, 2)
         self.assertEqual(self.run_ci("examples/demo", "--require-upload").returncode, 2)
         self.assertEqual(self.run_ci("examples/demo", "--server", "ftp://x", "--project", "p").returncode, 2)
+        insecure = self.run_ci("examples/demo", "--server", "http://crab.example.com", "--project", "p",
+                               "--token", TOKEN)
+        self.assertEqual(insecure.returncode, 2)
+        self.assertIn("must use https", insecure.stderr)
 
     def test_end_to_end_on_github(self):
         with tempfile.TemporaryDirectory() as folder:

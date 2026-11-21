@@ -142,15 +142,27 @@ def checkov(doc, root):
         if type(count) is not int or count < 0:
             raise ValueError("invalid parser error count")
         result.partial |= count > 0
+        framework = token(block["check_type"])
         for row in array(checks["failed_checks"]):
             path = checkov_path(row, root)
             start, end = array(row["file_line_range"])
+            if framework == "secrets":
+                # Checkov names a secret finding by the SHA-1 of the secret value. That hash would let
+                # report readers verify guesses, so the resource is dropped like Gitleaks secrets.
+                hit = source("checkov", "Sniffer", row["check_id"], path, start, end,
+                             row.get("severity") or "unknown")
+                hit.update(framework=framework, cwe=list(SECRET_CWE),
+                           message="Review the credential detector match and rotate any exposed credential.")
+                if not row.get("severity"):
+                    hit["severity"] = "high"
+                result.findings.append(hit)
+                continue
             resource = row["resource"]
             if not isinstance(resource, str) or not re.fullmatch(r"""[\w.:/@+\[\]"'=-]{1,512}""", resource):
                 raise ValueError("invalid resource address")
             hit = source("checkov", "Burrow", row["check_id"], path,
                          start, end, row.get("severity") or "unknown", identity=resource)
-            hit.update(resource=resource, framework=token(block["check_type"]))
+            hit.update(resource=resource, framework=framework)
             if http_uri(row.get("guideline")):
                 hit["help_uri"] = row["guideline"]
             result.findings.append(hit)
@@ -163,8 +175,8 @@ def checkov_path(row, root):
     absolute = row.get("file_abs_path")
     if isinstance(absolute, str) and root is not None and Path(absolute).is_absolute():
         try:
-            return relative_path(Path(absolute).resolve().relative_to(Path(root).resolve()).as_posix())
-        except (ValueError, OSError):
+            return relative_path(absolute, root)
+        except ValueError:
             pass
     # file_path is relative to the scan root behind a virtual leading separator ("/" on
     # POSIX, "\" on Windows); repo_file_path depends on the producer's working directory.
@@ -405,7 +417,7 @@ def cwe_from_relationships(entries):
 class SarifRun:
     def __init__(self, run, root):
         self.run = mapping(run)
-        self.root = Path(root).resolve() if root is not None else None
+        self.target = root
         tool = mapping(self.run["tool"])
         self.driver = mapping(tool["driver"])
         self.extensions = [e for e in tool.get("extensions") or [] if isinstance(e, dict)]
@@ -492,11 +504,11 @@ class SarifRun:
         if path is None:
             return None, None
         if isinstance(path, Path):
-            if not path.is_absolute() or self.root is None:
+            if not path.is_absolute() or self.target is None:
                 return None, None
             try:
-                path = Path(path).resolve().relative_to(self.root).as_posix()
-            except (ValueError, OSError):
+                path = relative_path(str(path), self.target)
+            except ValueError:
                 return None, None
         path = relative_path(path.removeprefix("./"))
         region = physical.get("region") if isinstance(physical.get("region"), dict) else {}

@@ -29,12 +29,12 @@
   },
   "$defs": {
     "level": {"enum": ["critical", "high", "medium", "low", "info", "unknown"]},
-    "fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-    "identifier": {"type": "string", "pattern": "^[\\w@.+:/~^!-]{1,256}$"},
+    "fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}(?!\\n)$"},
+    "identifier": {"type": "string", "pattern": "^[\\w@.+:/~^!-]{1,256}(?!\\n)$"},
     "nullableIdentifier": {"anyOf": [{"$ref": "#/$defs/identifier"}, {"type": "null"}]},
-    "httpUri": {"type": "string", "pattern": "^https?://[^\\s\\x00-\\x1f]{1,2040}$"},
+    "httpUri": {"type": "string", "pattern": "^https?://[^\\s\\x00-\\x1f]{1,2040}(?!\\n)$"},
     "position": {"type": "integer", "minimum": 1},
-    "date": {"type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$"},
+    "date": {"type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}(?!\\n)$"},
     "import": {
       "type": "object",
       "additionalProperties": false,
@@ -100,7 +100,7 @@
         "end_line": {"$ref": "#/$defs/position"},
         "column": {"$ref": "#/$defs/position"},
         "end_column": {"$ref": "#/$defs/position"},
-        "cwe": {"type": "array", "items": {"type": "string", "pattern": "^CWE-[1-9][0-9]{0,5}$"}, "uniqueItems": true},
+        "cwe": {"type": "array", "items": {"type": "string", "pattern": "^CWE-[1-9][0-9]{0,5}(?!\\n)$"}, "uniqueItems": true},
         "help_uri": {"$ref": "#/$defs/httpUri"},
         "confidence": {"$ref": "#/$defs/identifier"},
         "resource": {"type": "string", "maxLength": 512},
@@ -109,7 +109,7 @@
         "end_byte_offset": {"type": "integer", "minimum": 0},
         "package": {"$ref": "#/$defs/package"},
         "manifest": {"type": ["string", "null"], "maxLength": 4096},
-        "image_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "image_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}(?!\\n)$"},
         "aliases": {"type": "array", "items": {"$ref": "#/$defs/identifier"}},
         "risk_type": {"enum": ["vulnerability", "malicious", "license"]},
         "fixed_version": {"$ref": "#/$defs/identifier"},
@@ -152,7 +152,7 @@
         "revision": {"$ref": "#/$defs/nullableIdentifier"},
         "mapping_version": {"type": "integer", "minimum": 1},
         "severity": {"$ref": "#/$defs/level"},
-        "image_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+        "image_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}(?!\\n)$"}
       }
     },
     "inventory": {
@@ -229,7 +229,7 @@
             "additionalProperties": false,
             "required": ["gate", "count"],
             "properties": {
-              "gate": {"type": "string", "pattern": "^(severity|secrets|malicious|kev|epss|licenses|max:(critical|high|medium|low|info|unknown))$"},
+              "gate": {"type": "string", "pattern": "^(severity|secrets|malicious|kev|epss|licenses|max:(critical|high|medium|low|info|unknown))(?!\\n)$"},
               "count": {"type": "integer", "minimum": 0},
               "limit": {"type": "integer", "minimum": 0}
             }

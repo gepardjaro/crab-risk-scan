@@ -35,7 +35,7 @@ An engine without matching files is `skipped` with reason `not_applicable` in ev
 | opengrep | opengrep | 2.0.0 | Files in the languages of the packaged `opengrep-v1.yml` pack | `--no-git-ignore`, `--disable-nosem`, `--x-ignore-semgrepignore-files`. The pack is copied into the private cwd. | 0 complete, any other value failed |
 | bandit | bandit | 1.9.4 | `.py`, `.pyw` | `--ini` with an empty private file (ignores the target `.bandit`), `--ignore-nosec` | 0 or 1 complete, other failed |
 | gitleaks | gitleaks | 8.28.0 | Any file | `dir` mode, `--redact`, `--config` with a private `[extend] useDefault = true` file (ignores the target `.gitleaks.toml`), `--ignore-gitleaks-allow`, `--exit-code 99` | 0 or 99 complete, other failed |
-| checkov | checkov | 3.2.495 | Terraform, Bicep, Dockerfile, Helm, GitHub Actions, YAML or JSON | `--directory=DIR` as one token plus an empty private `--config-file`, so Checkov does not load the target `.checkov.yaml`. Also `--skip-download`, `--skip-results-upload`, `--download-external-modules false`, `--compact`, `--soft-fail`, and `--framework` limited to the file types present. | 0 complete, other failed |
+| checkov | checkov | 3.2.495 | Terraform, Bicep, Dockerfile, GitHub Actions, YAML or JSON; Helm charts only with `--online` | `--directory=DIR` as one token plus an empty private `--config-file`, so Checkov does not load the target `.checkov.yaml`. Also `--skip-download`, `--skip-results-upload`, `--download-external-modules false`, `--compact`, `--soft-fail`, and `--framework` limited to the file types present. The `helm` framework runs `helm template --dependency-update`, which downloads chart dependencies and writes them into the target, so it is selected only with `--online`. | 0 complete, other failed |
 | shellcheck | shellcheck | 0.11.0 | `.sh`, `.bash`, `.ksh`, `.bats` | `--norc`, explicit file list in batches of 200, no `-x` | 0 or 1 complete, 2 partial, other failed |
 | psscriptanalyzer | psscriptanalyzer | 1.24.0 (module) | `.ps1`, `.psm1`, `.psd1` | `pwsh -NoProfile -NonInteractive` runs the packaged [`engines/psscriptanalyzer.ps1`](../crab_risk_scan/engines/psscriptanalyzer.ps1) with explicit settings (ignores the target `PSScriptAnalyzerSettings.psd1`) | 0 complete, other failed |
 | trivy | trivy | 0.76.2 | A lockfile or manifest | `filesystem --scanners vuln --pkg-types library --skip-db-update --skip-java-db-update --offline-scan --skip-version-check --disable-telemetry --cache-dir CACHE/trivy`, empty private `--config` and `--ignorefile` | 0 complete, other failed |
@@ -53,7 +53,7 @@ Every engine run uses these controls:
 | Environment | Allow-list of system variables. `PATH` loses relative entries and entries inside the target. `HOME`, `USERPROFILE`, `XDG_*`, `APPDATA`, `LOCALAPPDATA`, `TMP` and `TEMP` point into a private directory. Telemetry and update checks are off. |
 | Working directory | A fresh private directory outside the target, so engines never load configuration from the target as their cwd |
 | Input and output | stdin is closed. stderr is discarded because diagnostics can quote source. Reports are written to the private directory. |
-| Limits | `--engine-timeout` (default 900 seconds) kills the process tree. On POSIX, CPU time, core dumps (0) and file size (4 GiB) are also limited. |
+| Limits | `--engine-timeout` (default 900 seconds) is one deadline for all of an engine's commands, including ShellCheck batches. Expiry kills the process tree. On POSIX, CPU time, core dumps (0) and file size (4 GiB) are also limited. |
 
 `crab-risk-scan engines` lists each engine with its pinned version, resolved path, detected version and status (`ok`, `version_mismatch`, `not_installed`). `--json` prints the same records.
 
@@ -64,10 +64,17 @@ Every engine run uses these controls:
 | Install type | Engines | Result |
 |---|---|---|
 | download | opengrep, gitleaks, shellcheck, trivy, osv-scanner, syft | Release asset downloaded with urllib and checked against the locked SHA-256 before use. Archives are extracted member by member. Absolute paths, `..`, drive letters and links are rejected. Executables go to `DIR/bin`. |
-| pip | bandit, checkov | A venv per engine in `DIR/venvs/<engine>` with a shim in `DIR/bin`. Shims are a `#!/bin/sh` exec script on POSIX and a console launcher on Windows. |
+| pip | bandit, checkov | A venv per engine in `DIR/venvs/<engine>` with a shim in `DIR/bin`. Packages come from the hash-locked requirement file named in the lock file ([`engines/`](../crab_risk_scan/engines)), installed with `--require-hashes --no-deps --only-binary :all:`. `python -I` and a private working directory keep the current directory off `sys.path`. Shims are a `#!/bin/sh` exec script on POSIX and a console launcher on Windows. |
 | module | psscriptanalyzer | Nupkg verified and extracted to `DIR/modules/PSScriptAnalyzer/1.24.0`. Scans add `CRAB_ENGINE_DIR/../modules` to `PSModulePath`. PowerShell 7 (`pwsh`) must be installed separately. |
 
-Platforms: `linux-x86_64`, `linux-aarch64`, `darwin-x86_64`, `darwin-arm64`, `windows-x86_64`. Digests come from the GitHub release asset `digest` metadata. The PSScriptAnalyzer nupkg has no GitHub digest. Its SHA-256 was recorded after the file matched the PowerShell Gallery SHA-512 package hash. Pip engines are pinned by version, not by hash, so their transitive dependencies resolve at install time.
+Platforms: `linux-x86_64`, `linux-aarch64`, `darwin-x86_64`, `darwin-arm64`, `windows-x86_64`. Digests come from the GitHub release asset `digest` metadata. The PSScriptAnalyzer nupkg has no GitHub digest. Its SHA-256 was recorded after the file matched the PowerShell Gallery SHA-512 package hash.
+
+Pip engine requirement files pin every transitive dependency with SHA-256 hashes for all published wheels, so one file serves every platform and Python 3.11 or newer. To update an engine, change its `version` and `package` in the lock file, then regenerate its file from a one-line input holding the package pin:
+
+```sh
+uv pip compile --universal --generate-hashes --python-version 3.11 --only-binary :all: --no-header checkov.in \
+  -o crab_risk_scan/engines/checkov-requirements.txt
+```
 
 ## Offline databases
 
@@ -83,6 +90,8 @@ With DIRECTORY, OSV downloads only the ecosystems whose lockfiles are present. W
 ## Saved-report imports
 
 Flags are repeatable and keep their command-line order. Imports have origin `report` and status `imported` unless the report exposes a problem. Keep report files outside the scanned directory.
+
+Paths in imported reports are checked without touching the file system. An absolute path must lie inside the scanned directory, as given or fully resolved, and is turned into a relative path. UNC and device paths (`\\server\share`, `//server/share`, `\\?\`, `\\.\`) are rejected before any file access, because opening one makes Windows authenticate to the named host. NaN and Infinity constants in any JSON input are rejected.
 
 | Flag | Expected producer output | Notes |
 |---|---|---|
@@ -143,7 +152,7 @@ c++ -shared parser.o scanner.o -o mojo.so
 | Ignore files in the target | Gitleaks reads `.gitleaksignore` from the scanned directory. It can drop findings by Gitleaks fingerprint. |
 | Directory-scoped configuration | Checkov 3.2.495 adds `DIR/.checkov.yaml` to its config search only when `--directory` appears as a separate argument. CRAB passes `--directory=DIR` instead. This relies on Checkov internals. Review this, and any new configuration discovery in other engines, before updating the lock file. |
 | Engine parsers | Engines parse untrusted files. Process isolation limits configuration, environment and time. It does not sandbox file system or network access. Use the container image with `--network none` for strong isolation. |
-| Pip engines | bandit and checkov install from PyPI by version. Their dependencies are not hash-pinned. |
+| Pip engine supply chain | bandit and checkov install only the hash-locked wheels in their requirement files. A compromised release cannot change them, but the locked set must be reviewed when it is regenerated. |
 | Images | `trivy-image` reads local images when offline. Pulling from a registry needs `--online`. |
 | Windows process trees | Timeouts use `taskkill /T`. POSIX resource limits do not apply on Windows. |
 

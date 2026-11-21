@@ -9,9 +9,11 @@ import sys
 import tarfile
 import tempfile
 import threading
+import time
 import unittest
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from crab_risk_scan import engines
@@ -102,6 +104,18 @@ class CommandTests(Folder):
         self.assertNotIn("--directory", argv)
         self.assertTrue(Path(argv[argv.index("--config-file") + 1]).is_relative_to(ctx.work.cwd))
         self.assertEqual(command.stdout, ctx.report)
+
+    def test_checkov_helm_framework_only_online(self):
+        # Regression (security review F18): `helm template --dependency-update` downloads chart
+        # dependencies and writes them into the target, so offline scans must not select helm.
+        (self.target / "Chart.yaml").write_text("apiVersion: v2\nname: demo\nversion: 1.0.0\n")
+        (self.target / "main.tf").write_text("x")
+        files = engines.inventory(self.target)
+        self.assertNotIn("helm", engines.checkov_frameworks(files))
+        self.assertIn("helm", engines.checkov_frameworks(files, online=True))
+        _, (command,) = self.build("checkov")
+        self.assertNotIn("helm", command.argv)
+        self.assertIn("kubernetes", command.argv)
 
     def test_shellcheck_norc_and_batches(self):
         for index in range(engines.SHELLCHECK_BATCH + 3):
@@ -403,6 +417,7 @@ class LockFileTests(unittest.TestCase):
             with self.subTest(tool=tool):
                 if entry["install"] == "pip":
                     self.assertEqual(entry["package"], f"{tool}=={entry['version']}")
+                    self.assert_hash_locked(engines.pip_requirements(entry), entry["package"])
                     continue
                 expected = {"any"} if entry["install"] == "module" else set(engines.PLATFORMS)
                 self.assertEqual(set(entry["assets"]), expected)
@@ -414,6 +429,17 @@ class LockFileTests(unittest.TestCase):
                         self.assertIn(asset["format"], ("zip", "tar.gz", "tar.xz"))
                         if entry["install"] == "download":
                             self.assertTrue(asset["member"])
+
+    def assert_hash_locked(self, path, package):
+        pins = []
+        for block in re.split(r"\n(?=\S)", path.read_text(encoding="utf-8")):
+            if block.startswith("#") or not block.strip():
+                continue
+            requirement = block.split("\\", 1)[0].strip()
+            self.assertRegex(requirement, r"^[A-Za-z0-9._-]+==[^\s;]+( ; .+)?$")
+            self.assertRegex(block, r"--hash=sha256:[0-9a-f]{64}")
+            pins.append(requirement.split(" ;", 1)[0])
+        self.assertIn(package, pins)
 
     def test_rule_pack_languages(self):
         suffixes = engines.rule_pack_suffixes()
@@ -446,3 +472,40 @@ class SbomPathTests(unittest.TestCase):
                              ["/package-lock.json", "/web/package.json", "left-pad", "/"])
             self.assertNotIn(target.as_posix(), json.dumps(cleaned))
             self.assertNotIn(json.dumps(native)[1:-1], json.dumps(cleaned))
+
+
+class PipInstallTests(Folder):
+    def test_pip_engines_install_hash_locked_wheels_in_isolated_mode(self):
+        # Regression (security review F14, F19): pip engines installed unhashed packages, and
+        # `python -m venv`/`-m pip` ran with the caller's working directory on sys.path.
+        dest = self.base / "engines"
+        dest.mkdir()
+        entry = engines.load_lock()["engines"]["bandit"]
+        calls = []
+        with mock.patch("crab_risk_scan.engines.subprocess.run",
+                        side_effect=lambda argv, **kw: calls.append((argv, kw))), \
+                mock.patch("crab_risk_scan.engines._write_file"), \
+                mock.patch("crab_risk_scan.engines._windows_launcher", return_value=b""):
+            engines._install_pip("bandit", entry, dest)
+        (venv_argv, venv_kw), (pip_argv, pip_kw) = calls
+        self.assertEqual(venv_argv[1:4], ["-I", "-m", "venv"])
+        self.assertEqual(pip_argv[1:4], ["-I", "-m", "pip"])
+        self.assertEqual((venv_kw["cwd"], pip_kw["cwd"]), (dest, dest))
+        for flag in ("--require-hashes", "--no-deps", "--only-binary"):
+            self.assertIn(flag, pip_argv)
+        self.assertEqual(Path(pip_argv[pip_argv.index("-r") + 1]), engines.pip_requirements(entry))
+        self.assertNotIn(entry["package"], pip_argv)
+
+
+class DeadlineTests(Folder):
+    def test_engine_timeout_bounds_all_commands_together(self):
+        # Regression (security review F21): each command got the full timeout, so ShellCheck's
+        # batches could run for (batches x timeout) seconds.
+        work = self.workspace()
+        nap = engines.Command([sys.executable, "-c", "import time; time.sleep(0.7)"])
+        engine = engines.Engine("napper", "napper", "napper", "none", lambda ctx: [nap, nap, nap],
+                                lambda code: "complete", lambda files, options: True)
+        ctx = context("napper", self.target, work)
+        started = time.monotonic()
+        self.assertEqual(engines.run_engine(engine, ctx, 1), ("failed", "timeout"))
+        self.assertLess(time.monotonic() - started, 2.5)

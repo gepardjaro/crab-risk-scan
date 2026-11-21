@@ -76,7 +76,8 @@ Install the extra first: `pip install 'crab-risk-scan[docx]'`. Without it, DOCX 
 - Placeholders are replaced before the report content is inserted, so finding text is never substituted.
 - Without a `{{CRAB_REPORT}}` paragraph, the content is appended at the end.
 - Content uses the template's `Heading 1-3`, `List Bullet`, `List Number` and `Light Grid Accent 1` or `Table Grid` styles when they exist, and plain formatting otherwise.
-- Templates larger than 25 MiB or that python-docx cannot open are rejected.
+- Templates larger than 25 MiB, expanding beyond 100 MiB or 2000 parts, or that python-docx cannot open are rejected.
+- Templates with macros (`vbaProject.bin`), ActiveX controls or embedded objects are rejected, and so are external relationships other than hyperlinks. External templates, frames and images load when a document opens, which would turn every generated report into a beacon or, with a UNC target, an NTLM credential leak.
 
 ## SARIF details
 
@@ -113,7 +114,7 @@ The region is line 1. A `logicalLocations` entry names the package and its purl,
 | Format | Protection |
 |---|---|
 | All | Reports contain CRAB-curated messages and structured fields only. Producer descriptions, source fragments and secret values are never copied. |
-| Markdown | Untrusted values are on one line, Markdown punctuation is backslash-escaped (pipes, backticks, brackets, `@`), and `&`, `<`, `>` and `"` become entities. A crafted path cannot break a table, open a code span, inject HTML or mention a user. |
+| Markdown | Untrusted values are on one line, Markdown punctuation is backslash-escaped (pipes, backticks, brackets, `@`), and `&`, `<`, `>` and `"` become entities. A crafted path cannot break a table, open a code span, inject HTML or mention a user. Link targets, including SARIF `help.markdown`, are percent-encoded except for URL delimiters, so a crafted `help_uri` cannot close the link, add an image or split a table cell. |
 | HTML | Data is JSON in a non-executable `<script type="application/json">` block with `<`, `>` and `&` written as `\u003c`, `\u003e` and `\u0026`. The page is built with DOM APIs and `textContent`; it never assigns data to `innerHTML`. Links are created only for `http` and `https` URLs. |
 | HTML | A Content-Security-Policy meta tag sets `default-src 'none'` and allows the inline script and stylesheet only by SHA-256 hash. Images, forms, frames and network requests are blocked. |
 | CSV | Text cells that start with `=`, `+`, `-`, `@`, tab or carriage return get a leading apostrophe, so spreadsheets do not evaluate them as formulas. Numbers are written as numbers. |
