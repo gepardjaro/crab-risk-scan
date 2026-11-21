@@ -53,7 +53,7 @@ Hardening:
 
 All on Windows 11 with Python 3.14, after the fixes:
 
-- **Test suite:** `python -m unittest discover -s tests` ran 270 tests and passed. Three were skipped: the Mojo grammar is not built here, and creating symlinks needs a privilege this account lacks (two tests). The real scanners were installed, so the live engine tests ran too.
+- **Test suite:** `python -m unittest discover -s tests` ran 271 tests and passed. Three were skipped: the Mojo grammar is not built here, and creating symlinks needs a privilege this account lacks (two tests). The real scanners were installed, so the live engine tests ran too.
 - **WebUI:** `npm run typecheck`, `npm test` (24 tests) and `npm run build` all pass. `npm audit` reports 0 vulnerabilities.
 - **Live server:** 14 of 14 checks passed against a running server:
   - API docs disabled.
@@ -69,6 +69,7 @@ All on Windows 11 with Python 3.14, after the fixes:
   - `engines install --engine bandit` installed from the locked wheels.
   - The Checkov lock installed with `--require-hashes` and passed `pip check`.
   - Both image requirement files installed with `--require-hashes` on Python 3.13, followed by `--no-build-isolation` installs of CRAB that scanned and rendered successfully.
+- **CI:** all six jobs passed on the fork, [run 44920046017](https://github.com/gepardjaro/crab-risk-scan/actions/runs/44920046017): unit tests on Ubuntu (Python 3.11), Windows and macOS (Python 3.13), live engines, the WebUI and the installed wheel. The first run after the fixes showed that lexical path checks rejected macOS `/var` and Windows 8.3 short-name aliases of the scan roots. Containment now compares against each root as configured and as resolved, then checks the resolved path inside the resolved root.
 
 ## Residual risks
 
